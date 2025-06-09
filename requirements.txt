@@ -2,7 +2,7 @@ pandas==2.2.3
 scikit_learn==1.5.2
 torch
 git+https://github.com/roboflow/sports.git#egg=sports
-ultralytics==8.3.7
+ultralytics==8.0.196
 roboflow==1.1.47
 gdown 
 supervision>=0.23.0
