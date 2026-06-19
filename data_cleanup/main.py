@@ -1,19 +1,26 @@
 """
 Command-line tracking entry point.
 
-This is a script version of ``track/track.ipynb``: it runs the Roboflow player
-and pitch detection models over a video and writes raw tracking data (player &
-ball pitch coordinates per frame) to a CSV that the rest of the pipeline
-(``data_cleanup`` cleaning and ``event_generation``) can consume.
+This is a script version of ``track/track.ipynb``, using **ultralytics YOLOv8**
+for detection (no Roboflow API key required). It runs YOLOv8 over a video to
+detect players and the ball, and writes raw tracking data (player & ball pitch
+coordinates per frame) to a CSV that the rest of the pipeline (``data_cleanup``
+cleaning and ``event_generation``) can consume.
 
 Example:
     python data_cleanup/main.py \\
         --video ./track/footage/2e57b9_0.mp4 \\
-        --output ./track/output \\
-        --api-key $ROBOFLOW_API
+        --output ./track/output
 
 The CSV is written to ``<output>/<video name>.csv`` in the "raw" format read by
 ``Match.import_raw_data``.
+
+Note: a generic COCO ``yolov8n.pt`` detects people ("player") and the
+"sports ball" but has no pitch keypoint model, so pitch coordinates are taken
+directly from image space (each detection's bottom-centre pixel, normalised to
+the standard pitch dimensions) rather than via a homography. The coordinates are
+therefore in camera perspective and approximate. Point ``--player-model`` /
+``--ball-model`` at a football-trained ``.pt`` for better detections.
 """
 
 import argparse
@@ -22,74 +29,63 @@ import os
 import numpy as np
 from tqdm import tqdm
 
-# Public Roboflow Universe models used by the tracking notebook. Override with
-# the project/version you trained yourself via --player-model / --pitch-model.
-DEFAULT_PLAYER_MODEL_ID = "football-players-detection-3zvbc-btky1/1"
-DEFAULT_PITCH_MODEL_ID = "football-field-detection-f07vi-yukgc/1"
+# Default ultralytics weights. ``yolov8n.pt`` downloads automatically on first
+# use and needs no API key. Override with football-trained weights if you have
+# them.
+DEFAULT_PLAYER_MODEL = "yolov8n.pt"
+DEFAULT_BALL_MODEL = "yolov8n.pt"
 
-OBJECTS = {"ball": 0, "goalkeeper": 1, "player": 2, "referee": 3}
+# COCO class ids produced by the stock yolov8 weights.
+COCO_PERSON = 0
+COCO_SPORTS_BALL = 32
+
+# Standard pitch dimensions (centimetres) used to scale normalised image-space
+# coordinates. Matches the dimensions assumed by ``lib.pitch`` for "raw" data.
+PITCH_LENGTH_CM = 12000.0
+PITCH_WIDTH_CM = 7000.0
 
 
-def resolve_goalkeepers_team_id(players, goalkeepers):
+def image_to_pitch(detections, frame_w, frame_h):
+    """Project detections to (approximate) pitch coordinates from image space.
+
+    Uses each detection's bottom-centre pixel, normalised by the frame size and
+    scaled to the standard pitch dimensions. No homography / keypoint model.
+    """
     import supervision as sv
 
-    goalkeepers_xy = goalkeepers.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    players_xy = players.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    team_0_centroid = players_xy[players.class_id == 0].mean(axis=0)
-    team_1_centroid = players_xy[players.class_id == 1].mean(axis=0)
-    goalkeepers_team_id = []
-    for goalkeeper_xy in goalkeepers_xy:
-        dist_0 = np.linalg.norm(goalkeeper_xy - team_0_centroid)
-        dist_1 = np.linalg.norm(goalkeeper_xy - team_1_centroid)
-        goalkeepers_team_id.append(0 if dist_0 < dist_1 else 1)
-    return np.array(goalkeepers_team_id)
+    if len(detections) == 0:
+        return np.zeros((0, 2))
+    anchors = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER).astype(float)
+    pitch = np.empty_like(anchors)
+    pitch[:, 0] = anchors[:, 0] / frame_w * PITCH_LENGTH_CM
+    pitch[:, 1] = anchors[:, 1] / frame_h * PITCH_WIDTH_CM
+    return pitch
 
 
-def get_detections(frame, detections, key_points, tracker, team_classifier):
+def get_detections(frame, player_result, ball_result, tracker, team_classifier,
+                   frame_w, frame_h):
     import supervision as sv
-    from sports.common.view import ViewTransformer
-    from sports.configs.soccer import SoccerPitchConfiguration
 
-    CONFIG = SoccerPitchConfiguration()
+    # Players (COCO "person").
+    detections = sv.Detections.from_ultralytics(player_result)
+    players_detections = detections[detections.class_id == COCO_PERSON]
+    players_detections = players_detections.with_nms(threshold=0.5, class_agnostic=True)
+    players_detections = tracker.update_with_detections(detections=players_detections)
 
-    ball_detections = detections[detections.class_id == OBJECTS["ball"]]
-    ball_detections.xyxy = sv.pad_boxes(xyxy=ball_detections.xyxy, px=10)
-
-    all_detections = detections[detections.class_id != OBJECTS["ball"]]
-    all_detections = all_detections.with_nms(threshold=0.5, class_agnostic=True)
-    all_detections = tracker.update_with_detections(detections=all_detections)
-
-    goalkeepers_detections = all_detections[all_detections.class_id == OBJECTS["goalkeeper"]]
-    players_detections = all_detections[all_detections.class_id == OBJECTS["player"]]
-
-    if team_classifier:
+    if team_classifier and len(players_detections):
         players_crops = [sv.crop_image(frame, xyxy) for xyxy in players_detections.xyxy]
         players_detections.class_id = team_classifier.predict(players_crops)
+    else:
+        players_detections.class_id = np.zeros(len(players_detections), dtype=int)
 
-    goalkeepers_detections.class_id = resolve_goalkeepers_team_id(
-        players_detections, goalkeepers_detections)
+    # Ball (COCO "sports ball").
+    ball_all = sv.Detections.from_ultralytics(ball_result)
+    ball_detections = ball_all[ball_all.class_id == COCO_SPORTS_BALL]
 
-    # Project image-space detections onto the 2D pitch.
-    confidence_filter = key_points.confidence[0] > 0.5
-    frame_reference_points = key_points.xy[0][confidence_filter]
-    pitch_reference_points = np.array(CONFIG.vertices)[confidence_filter]
+    players_detections.data["pitch_xy"] = image_to_pitch(players_detections, frame_w, frame_h)
+    ball_detections.data["pitch_xy"] = image_to_pitch(ball_detections, frame_w, frame_h)
 
-    transformer = ViewTransformer(
-        source=frame_reference_points,
-        target=pitch_reference_points,
-    )
-
-    frame_ball_xy = ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    ball_detections.data["pitch_xy"] = transformer.transform_points(points=frame_ball_xy)
-
-    frame_goalkeepers_xy = goalkeepers_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    goalkeepers_detections.data["pitch_xy"] = transformer.transform_points(points=frame_goalkeepers_xy)
-
-    frame_players_xy = players_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
-    players_detections.data["pitch_xy"] = transformer.transform_points(points=frame_players_xy)
-
-    all_detections = sv.Detections.merge([players_detections, goalkeepers_detections])
-    return all_detections, ball_detections
+    return players_detections, ball_detections
 
 
 def generate_team_model(video_path, player_model, stride=30):
@@ -99,8 +95,9 @@ def generate_team_model(video_path, player_model, stride=30):
     frame_generator = sv.get_video_frames_generator(source_path=video_path, stride=stride)
     crops = []
     for frame in tqdm(frame_generator, desc="collecting crops"):
-        result = player_model.infer(frame, confidence=0.3)[0]
-        detections = sv.Detections.from_inference(result)
+        result = player_model(frame, conf=0.3, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+        detections = detections[detections.class_id == COCO_PERSON]
         crops += [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
     team_classifier = TeamClassifier(device="cuda") if _cuda_available() else TeamClassifier()
@@ -139,20 +136,15 @@ def save_tracking_results(players, ball, frames, output_path):
     return output_path
 
 
-def track(video_path, output_dir, api_key,
-          player_model_id=DEFAULT_PLAYER_MODEL_ID,
-          pitch_model_id=DEFAULT_PITCH_MODEL_ID,
+def track(video_path, output_dir,
+          player_model_path=DEFAULT_PLAYER_MODEL,
+          ball_model_path=DEFAULT_BALL_MODEL,
           track_teams=True, generate_video=False, stride=30):
-    os.environ.setdefault("ONNXRUNTIME_EXECUTION_PROVIDERS", "[CUDAExecutionProvider]")
-
     import supervision as sv
-    from inference import get_model
-    from sports.configs.soccer import SoccerPitchConfiguration
+    from ultralytics import YOLO
 
-    CONFIG = SoccerPitchConfiguration()
-
-    player_model = get_model(model_id=player_model_id, api_key=api_key)
-    pitch_model = get_model(model_id=pitch_model_id, api_key=api_key)
+    player_model = YOLO(player_model_path)  # downloads automatically, no API key needed
+    ball_model = YOLO(ball_model_path)
 
     ellipse_annotator = triangle_annotator = label_annotator = None
     if generate_video:
@@ -172,6 +164,7 @@ def track(video_path, output_dir, api_key,
         team_classifier = generate_team_model(video_path, player_model, stride=stride)
 
     video_info = sv.VideoInfo.from_video_path(video_path=video_path)
+    frame_w, frame_h = video_info.width, video_info.height
     frame_generator = sv.get_video_frames_generator(video_path)
 
     players, ball = {}, {}
@@ -184,18 +177,14 @@ def track(video_path, output_dir, api_key,
         sink.__enter__()
 
     for frame in tqdm(frame_generator, desc="Collecting Tracking Data..."):
-        result = player_model.infer(frame, confidence=0.3)[0]
-        detections = sv.Detections.from_inference(result)
-
-        result = pitch_model.infer(frame, confidence=0.3)[0]
-        key_points = sv.KeyPoints.from_inference(result)
+        player_result = player_model(frame, conf=0.3, verbose=False)[0]
+        ball_result = ball_model(frame, conf=0.3, verbose=False)[0]
 
         all_detections, ball_detections = get_detections(
-            frame, detections, key_points, tracker, team_classifier)
+            frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h)
 
         object_ids = all_detections.tracker_id
         team_ids = all_detections.class_id
-        object_types = all_detections.data["class_name"]
         pitch_xys = all_detections.data["pitch_xy"]
         ball_pitch_xys = ball_detections.data["pitch_xy"]
         all_detections.class_id = all_detections.class_id.astype(int)
@@ -204,7 +193,6 @@ def track(video_path, output_dir, api_key,
             object_id = str(object_ids[idx])
             players.setdefault(object_id, {})
             players[object_id][str(frame_number)] = {
-                "Object Type": object_types[idx],
                 "Team": team_ids[idx],
                 "X1": xyxy[0], "Y1": xyxy[1], "X2": xyxy[2], "Y2": xyxy[3],
                 "X_Pitch": pitch_xys[idx][0], "Y_Pitch": pitch_xys[idx][1],
@@ -240,13 +228,13 @@ def track(video_path, output_dir, api_key,
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run YOLO/Roboflow tracking on match footage.")
+    parser = argparse.ArgumentParser(description="Run YOLOv8 (ultralytics) tracking on match footage.")
     parser.add_argument("--video", required=True, help="Path to the input .mp4 footage.")
     parser.add_argument("--output", default="./track/output", help="Directory for the tracking CSV.")
-    parser.add_argument("--api-key", default=os.getenv("ROBOFLOW_API"),
-                        help="Roboflow API key (defaults to the ROBOFLOW_API env var).")
-    parser.add_argument("--player-model", default=DEFAULT_PLAYER_MODEL_ID)
-    parser.add_argument("--pitch-model", default=DEFAULT_PITCH_MODEL_ID)
+    parser.add_argument("--player-model", default=DEFAULT_PLAYER_MODEL,
+                        help="Ultralytics weights for player detection (default yolov8n.pt).")
+    parser.add_argument("--ball-model", default=DEFAULT_BALL_MODEL,
+                        help="Ultralytics weights for ball detection (default yolov8n.pt).")
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
@@ -255,14 +243,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if not args.api_key:
-        raise SystemExit("A Roboflow API key is required (pass --api-key or set ROBOFLOW_API).")
     out = track(
         video_path=args.video,
         output_dir=args.output,
-        api_key=args.api_key,
-        player_model_id=args.player_model,
-        pitch_model_id=args.pitch_model,
+        player_model_path=args.player_model,
+        ball_model_path=args.ball_model,
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
