@@ -1,5 +1,7 @@
 pandas==2.2.3
 scikit_learn==1.5.2
+filterpy==1.4.5
+scipy
 torch
 git+https://github.com/roboflow/sports.git#egg=sports
 ultralytics==8.0.196

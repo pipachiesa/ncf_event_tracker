@@ -12,6 +12,8 @@ Convert football match footage into proffesional level player & ball tracking da
     - Tracking Match Footage
     - Cleaning Tracking Data
     - Generating Tracking Clips
+  - [Tracking Data to Event Data Pipeline](#tracking-data-to-event-data-pipeline)
+    - Generating Event Data
   - [Resources](#resources)
   - [Licenses](#license)
 
@@ -209,6 +211,67 @@ at the top of the script to include your file name `FILE_NAME`, the path of your
 
 ![before_after](./examples/before_after.png)
 
+## Tracking Data to Event Data Pipeline
+
+Once you have tracking data, you can automatically generate **match event data** from it &mdash; a structured log of every pass, ball lost, recovery, shot, goal, set piece and challenge in the clip. This implements the methodology described in [Generating Footballing Event Data from Match Tracking Data](https://medium.com/@johncomonitski/generating-footballing-event-data-from-match-tracking-data-1730c58ad598).
+
+> [!Tip]
+> **Run the whole pipeline in Google Colab.** [event_generation/colab_pipeline.ipynb](./event_generation/colab_pipeline.ipynb) runs tracking &rarr; event generation &rarr; visualization end-to-end on a GPU runtime, saving outputs to Google Drive. (Clone *your fork* of the repo in the notebook, since it relies on the event-generation code.)
+>
+> The tracking step can also be run from the command line with [data_cleanup/main.py](./data_cleanup/main.py):
+> ```shell
+> python data_cleanup/main.py --video ./track/footage/clip.mp4 --output ./track/output --api-key $ROBOFLOW_API
+> ```
+
+Event generation follows a 2 step process:
+1. **Possession Tracking** &mdash; A possession begins when the ball comes within the *possession radius* of its closest player, and ends once the ball leaves that player. Noise from momentary ball movement and failed tackles is filtered out to leave a clean possession list for the whole clip.
+2. **Event Detection** &mdash; The possession list is walked with a sliding `(previous, current, next)` window. `review_events` inspects each triple of possessions and classifies the footballing event that occurred between them.
+
+### Detected Events
+
+| Event | How it is detected |
+| --- | --- |
+| `PASS` | Possession moves between two players on the same team. Subtypes: `LONG BALL`, `CROSS`. |
+| `BALL LOST` / `RECOVERY` | Possession changes teams in open play. Flagged `INTERCEPTION` when the ball changed hands in flight. |
+| `SHOT` | The ball leaves a player heading goalward and reaches the attacking goal mouth. Subtypes: `GOAL`, `SAVED`, `OFF TARGET`. |
+| `GOAL` | A shot reaches the goal and is followed by a kick-off from the centre by the conceding team. |
+| `SET PIECE` | A restart after the ball leaves play. Subtypes: `KICK OFF`, `CORNER`, `GOAL KICK`, `THROW IN`. |
+| `CHALLENGE` | Opponents contesting a dropping ball. Subtypes: `AERIAL-WON`, `AERIAL-LOST` (best-effort &mdash; limited by 2D tracking). |
+
+### Generating Event Data
+
+1. Open the [Event Data Generation Notebook](./event_generation/events.ipynb).
+2. In the **_Tracking Data Import_** section, point the notebook at the tracking data you want to use (raw tracking output or cleaned data from the [Tracking Data Clean Up Notebook](./data_cleanup/cleanup.ipynb)).
+    ```python
+    PATH = "./../data_cleanup/output/"
+    FILE_NAME = ""
+
+    match = Match()
+    match.import_metrica(PATH, FILE_NAME)  # or match.import_raw_data(PATH, FILE_NAME)
+    ```
+3. Generate events. `generate_events()` returns an `EventLog` you can print, summarise, filter and export.
+    ```python
+    events = match.generate_events()
+    events.print()
+    print(events.summary())
+
+    for shot in events.filter("SHOT"):
+        print(shot)
+    ```
+    > [!Note]
+    > The possession radius is measured in metres on a standard 105 x 68 m pitch and defaults to a value robust for tracking-derived data. Tune it for your footage with `match.generate_events(possession_radius=2.0)`.
+4. Export your event data to the Metrica event-data CSV format. Results are written to the [event_generation/output/](./event_generation/output) directory.
+    ```python
+    events.export(path="./output/", file_name="events.csv")
+    ```
+
+The exported CSV uses the Metrica event-data columns: `Team, Type, Subtype, Period, Start Frame, Start Time [s], End Frame, End Time [s], From, To, Start X, Start Y, End X, End Y`.
+
+**Try it without footage:** [event_generation/test_synthetic.py](./event_generation/test_synthetic.py) builds a small synthetic Metrica tracking clip (kick off &rarr; passes &rarr; interception &rarr; throw-in &rarr; shot &rarr; goal) and runs the full pipeline end to end, so you can verify event generation works before tracking your own match.
+
+```shell
+python event_generation/test_synthetic.py
+```
 
 ## Resources
 - [Skalskip92's Football AI Tutorial: From Basics to Advanced Stats with Python](https://www.youtube.com/watch?v=aBVGKoNZQUw) - Essential to getting this project off the group and the foundation of the tracking & training notebook.

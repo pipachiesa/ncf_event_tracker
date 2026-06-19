@@ -1,6 +1,7 @@
 from lib.moment import Moment
 from lib.player import Player
 from lib.ball import Ball
+from lib.event_generator import EventGenerator, POSSESSION_RADIUS_M
 import csv
 
 class Match():
@@ -205,6 +206,24 @@ class Match():
         self.current_frame = 1
         return self.frame(self.current_frame)
     
+    def generate_events(self, possession_radius=POSSESSION_RADIUS_M):
+        """Generate footballing event data from this match's tracking data.
+
+        Returns an ``EventLog`` containing the detected passes, balls lost,
+        recoveries, shots, goals, set pieces and challenges. See
+        ``lib/event_generator.py`` for the methodology.
+        """
+        generator = EventGenerator(self, possession_radius=possession_radius)
+        self.event_generator = generator
+        return generator.generate()
+
+    def export_events(self, event_log, file_name=None):
+        """Export an ``EventLog`` to the Metrica event-data CSV format."""
+        if file_name is None:
+            base = (self.file_name or "match").rsplit(".", 1)[0]
+            file_name = base + "_events.csv"
+        return event_log.export(path="./output/", file_name=file_name)
+
     def export(self):
         data = []
         if(self.source == "metrica"):

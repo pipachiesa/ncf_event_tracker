@@ -10,7 +10,8 @@ train/datasets/*
 models/*
 lib/
 data_cleanup/output/*.csv
-data_cleanup/main.py
+event_generation/output/*.csv
+event_generation/synthetic_tracking.csv
 !data_cleanup/lib/
 !data_cleanup/lib/*.py
 
