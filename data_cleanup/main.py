@@ -41,6 +41,34 @@ import os
 import numpy as np
 from tqdm import tqdm
 
+
+def _patch_torch_load_for_ultralytics():
+    """Allow ultralytics ``.pt`` checkpoints to load under PyTorch >= 2.6.
+
+    PyTorch 2.6 flipped ``torch.load``'s default to ``weights_only=True``, which
+    refuses to unpickle the ultralytics model globals (``DetectionModel`` etc.)
+    and breaks ``YOLO(weights)`` on older ultralytics releases. Our checkpoints
+    come from trusted sources (official ultralytics weights and a public
+    football model on the HF Hub), so we restore the full-unpickle behaviour.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    if getattr(torch.load, "_ultralytics_patched", False):
+        return
+    _orig_load = torch.load
+
+    def _load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig_load(*args, **kwargs)
+
+    _load._ultralytics_patched = True
+    torch.load = _load
+
+
+_patch_torch_load_for_ultralytics()
+
 # Default ultralytics weights. ``yolov8n.pt`` downloads automatically on first
 # use and needs no API key.
 DEFAULT_PLAYER_MODEL = "yolov8n.pt"
