@@ -6,12 +6,18 @@ class Moment():
         self.players = moment_data["players"]
 
     def ball_loc(self):
-        return self.ball["frame"].coordinates
-    
+        frame = self.ball["frame"]
+        if frame is None:
+            return None
+        return frame.coordinates
+
     def player_loc(self, player_id):
         for player_data in self.players:
             player = player_data["object"]
             if(str(player_id) == str(player.id)):
-                return player_data["frame"].coordinates
+                frame = player_data["frame"]
+                if frame is None:
+                    return None
+                return frame.coordinates
         return None
         
