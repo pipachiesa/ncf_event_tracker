@@ -13,6 +13,10 @@ class Match():
         self.source = None
         self.file_path = None
         self.file_name = None
+        # Lazily-built {frame_number: [(player, frame_obj), ...]} index so
+        # ``frame()`` only touches players present in that frame instead of
+        # scanning all (often thousands of) tracked objects every call.
+        self._players_by_frame = None
 
     def import_metrica(self, file_path, file_name):
         self.source = "metrica"
@@ -166,10 +170,21 @@ class Match():
 
         return new_player
     
+    def _build_player_frame_index(self):
+        """Index every player's frames by frame number (built once, on demand)."""
+        index = {}
+        for player in self.players:
+            for fr in player.frames:
+                index.setdefault(fr.frame, []).append((player, fr))
+        self._players_by_frame = index
+
     def frame(self, frame_number):
         if(frame_number > self.frames):
             return None
-        
+
+        if self._players_by_frame is None:
+            self._build_player_frame_index()
+
         ball_frame = self.ball.frame(frame_number)
         ball = {
             "object" : self.ball,
@@ -177,13 +192,13 @@ class Match():
             "frame" : ball_frame
         }
 
-        players = []
-        for player in self.players:
-            players.append({
-                "object" : player,
-                "type" : "Player",
-                "frame" : player.frame(frame_number)
-            })
+        # Only include players actually present in this frame. Consumers
+        # (_nearest_player, player_loc, export) already treat an absent player
+        # exactly like one with no detection, so the result is identical.
+        players = [
+            {"object" : player, "type" : "Player", "frame" : fr}
+            for (player, fr) in self._players_by_frame.get(frame_number, [])
+        ]
 
         return Moment({
             "ball" : ball,
@@ -191,12 +206,11 @@ class Match():
             "frame" : ball_frame.frame,
             "time" : ball_frame.time
         })
-    
+
     def has_next_frame(self):
-        moment = self.frame(self.current_frame + 1)
-        if moment == None:
-            return False
-        return True
+        # frame() only returns None when the number exceeds the clip length, so
+        # this is an O(1) bounds check (no need to build a whole Moment).
+        return (self.current_frame + 1) <= self.frames
     
     def next_frame(self):
         self.current_frame = self.current_frame + 1

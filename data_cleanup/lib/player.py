@@ -8,6 +8,7 @@ class Player():
             self.name = player_data["name"]
             self.frames = []
             self.source = None
+            self._frame_index = {}  # {str(frame_number): Frame} for O(1) lookup
 
         def change_team(self, team):
             self.team = team
@@ -16,18 +17,19 @@ class Player():
             self.name = name
             
         def add_frame(self, frame_data):
-            if(str(type(frame_data)) == "<class 'frame.Frame'>"):
-                frames = self.frames
-                frames.append(frame_data)
-                self.frames = frames
-            else:
-                frames = self.frames
-                frames.append(Frame(frame_data))
-                self.frames = frames
+            frame_obj = frame_data if isinstance(frame_data, Frame) else Frame(frame_data)
+            self.frames.append(frame_obj)
+            self._frame_index[str(frame_obj.frame)] = frame_obj
 
         def frame(self, frame_number):
+            key = str(frame_number)
+            hit = self._frame_index.get(key)
+            if hit is not None:
+                return hit
+            # Fallback (and self-heal) in case the index is stale.
             for frame in self.frames:
-                if(str(frame.frame) == str(frame_number)):
+                if(str(frame.frame) == key):
+                    self._frame_index[key] = frame
                     return frame
             return None
         
@@ -79,6 +81,8 @@ class Player():
                     "y" : new_frame.y,
                     "empty" : new_frame.empty
                 })
+
+            self._frame_index[str(frame_number)] = self.frames[frame_number - 1]
 
         def plot(self):
             coordinates = self.path()

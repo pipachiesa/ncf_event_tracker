@@ -69,22 +69,27 @@ def _patch_torch_load_for_ultralytics():
 
 _patch_torch_load_for_ultralytics()
 
-# Default ultralytics weights. ``yolov8n.pt`` downloads automatically on first
-# use and needs no API key.
-DEFAULT_PLAYER_MODEL = "yolov8n.pt"
-
-# Ball model. The sentinel ``"football"`` resolves (in ``resolve_ball_model_path``)
-# to a football-specific checkpoint downloaded from the Hugging Face Hub, with a
-# fallback to ``yolov8m.pt``. Pass any ``.pt`` path to override.
+# Models. The sentinel ``"football"`` resolves (in ``resolve_model_path``) to a
+# football-trained YOLOv8 checkpoint downloaded from the Hugging Face Hub
+# (classes: ball/goalkeeper/player/referee), with a fallback to a stock
+# ultralytics model. Pass any ``.pt`` path to override.
+#
+# Using the football model for BOTH players and the ball gives far more
+# consistent player detection on broadcast footage than the generic COCO
+# ``yolov8n.pt`` -- which fragments tracks badly (thousands of short-lived IDs)
+# and can't separate players from referees. When both resolve to the same
+# weights we run a single inference per frame instead of two.
+DEFAULT_PLAYER_MODEL = "football"
+FALLBACK_PLAYER_MODEL = "yolov8n.pt"   # generic COCO "person" detector
 DEFAULT_BALL_MODEL = "football"
-FALLBACK_BALL_MODEL = "yolov8m.pt"
+FALLBACK_BALL_MODEL = "yolov8m.pt"     # medium COCO model: best small-object recall
 
 # Public, football-trained YOLOv8 weights (Roboflow "football-players-detection"
 # dataset, broadcast footage; classes: ball/goalkeeper/player/referee).
 # ``best.pt`` is a standard ultralytics checkpoint, downloadable without an API
 # key. mAP@0.5 ~0.785. Loads directly via ``YOLO(path)``.
-FOOTBALL_BALL_MODEL_REPO = "uisikdag/yolo-v8-football-players-detection"
-FOOTBALL_BALL_MODEL_FILE = "best.pt"
+FOOTBALL_MODEL_REPO = "uisikdag/yolo-v8-football-players-detection"
+FOOTBALL_MODEL_FILE = "best.pt"
 
 # The ball is small and easily missed; keep its confidence low.
 DEFAULT_BALL_CONF = 0.15
@@ -122,28 +127,25 @@ def image_to_pitch(detections, frame_w, frame_h):
     return pitch
 
 
-def resolve_ball_model_path(spec):
-    """Resolve the ``--ball-model`` argument to a loadable weights path.
+def resolve_model_path(spec, fallback):
+    """Resolve a model spec (``--player-model`` / ``--ball-model``) to a path.
 
-    ``"football"`` (the default) downloads a football-trained YOLOv8 checkpoint
-    from the Hugging Face Hub (no API key) and returns its local path, falling
-    back to ``yolov8m.pt`` if the download is unavailable. Any other value is
-    returned unchanged (an explicit ``.pt`` path or an ultralytics model name).
+    ``"football"`` downloads the football-trained YOLOv8 checkpoint from the
+    Hugging Face Hub (no API key) and returns its local path, falling back to
+    ``fallback`` if the download is unavailable. Any other value is returned
+    unchanged (an explicit ``.pt`` path or an ultralytics model name).
     """
     if spec != "football":
         return spec
     try:
         from huggingface_hub import hf_hub_download
 
-        path = hf_hub_download(
-            repo_id=FOOTBALL_BALL_MODEL_REPO, filename=FOOTBALL_BALL_MODEL_FILE)
-        print(f"Ball model: football-specific weights "
-              f"{FOOTBALL_BALL_MODEL_REPO}/{FOOTBALL_BALL_MODEL_FILE}")
+        path = hf_hub_download(repo_id=FOOTBALL_MODEL_REPO, filename=FOOTBALL_MODEL_FILE)
+        print(f"Using football-specific weights {FOOTBALL_MODEL_REPO}/{FOOTBALL_MODEL_FILE}")
         return path
     except Exception as exc:  # network down, hub error, or missing huggingface_hub
-        print(f"Could not fetch football ball model ({exc}); "
-              f"falling back to {FALLBACK_BALL_MODEL}")
-        return FALLBACK_BALL_MODEL
+        print(f"Could not fetch football model ({exc}); falling back to {fallback}")
+        return fallback
 
 
 def resolve_ball_class_id(model):
@@ -159,13 +161,32 @@ def resolve_ball_class_id(model):
     return COCO_SPORTS_BALL
 
 
+def resolve_player_class_ids(model):
+    """Class ids the tracker should treat as players (players + goalkeepers).
+
+    Football models expose ball/goalkeeper/player/referee; we keep players and
+    goalkeepers and drop the ball and the referee (so referees don't pollute the
+    player tracks or the team classifier). Stock COCO weights only have "person"
+    (id 0), which is then used as the fallback.
+    """
+    names = getattr(model, "names", None) or {}
+    ids = [int(class_id) for class_id, name in names.items()
+           if str(name).strip().lower() in ("player", "goalkeeper", "goal keeper", "person")]
+    return ids or [COCO_PERSON]
+
+
 def get_detections(frame, player_result, ball_result, tracker, team_classifier,
-                   frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL):
+                   frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL,
+                   player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF):
     import supervision as sv
 
-    # Players (COCO "person").
+    # Players: keep the player/goalkeeper classes (drop ball & referee). When a
+    # single shared model is run at the low ball confidence, also drop player
+    # boxes below ``player_conf`` so player behaviour stays unchanged.
     detections = sv.Detections.from_ultralytics(player_result)
-    players_detections = detections[detections.class_id == COCO_PERSON]
+    players_detections = detections[np.isin(detections.class_id, list(player_class_ids))]
+    if players_detections.confidence is not None:
+        players_detections = players_detections[players_detections.confidence >= player_conf]
     players_detections = players_detections.with_nms(threshold=0.5, class_agnostic=True)
     players_detections = tracker.update_with_detections(detections=players_detections)
 
@@ -185,16 +206,16 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     return players_detections, ball_detections
 
 
-def generate_team_model(video_path, player_model, stride=30):
+def generate_team_model(video_path, player_model, player_class_ids=(COCO_PERSON,), stride=30):
     import supervision as sv
     from sports.common.team import TeamClassifier
 
     frame_generator = sv.get_video_frames_generator(source_path=video_path, stride=stride)
     crops = []
     for frame in tqdm(frame_generator, desc="collecting crops"):
-        result = player_model(frame, conf=0.3, verbose=False)[0]
+        result = player_model(frame, conf=DEFAULT_PLAYER_CONF, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
-        detections = detections[detections.class_id == COCO_PERSON]
+        detections = detections[np.isin(detections.class_id, list(player_class_ids))]
         crops += [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
 
     team_classifier = TeamClassifier(device="cuda") if _cuda_available() else TeamClassifier()
@@ -285,16 +306,31 @@ def track(video_path, output_dir,
     import supervision as sv
     from ultralytics import YOLO
 
-    player_model = YOLO(player_model_path)  # downloads automatically, no API key needed
-
-    # Resolve and load the ball model, falling back to yolov8m.pt on any failure.
-    resolved_ball_path = resolve_ball_model_path(ball_model_path)
+    # Resolve and load the player model (football weights by default).
+    resolved_player_path = resolve_model_path(player_model_path, FALLBACK_PLAYER_MODEL)
     try:
-        ball_model = YOLO(resolved_ball_path)
+        player_model = YOLO(resolved_player_path)
     except Exception as exc:
-        print(f"Failed to load ball model '{resolved_ball_path}' ({exc}); "
-              f"using {FALLBACK_BALL_MODEL}")
-        ball_model = YOLO(FALLBACK_BALL_MODEL)
+        print(f"Failed to load player model '{resolved_player_path}' ({exc}); "
+              f"using {FALLBACK_PLAYER_MODEL}")
+        resolved_player_path = FALLBACK_PLAYER_MODEL
+        player_model = YOLO(FALLBACK_PLAYER_MODEL)
+    player_class_ids = resolve_player_class_ids(player_model)
+
+    # Resolve the ball model. If it resolves to the same weights as the player
+    # model, reuse it and run a single inference per frame.
+    resolved_ball_path = resolve_model_path(ball_model_path, FALLBACK_BALL_MODEL)
+    share_model = (resolved_ball_path == resolved_player_path)
+    if share_model:
+        ball_model = player_model
+        print("Player and ball share one model: running a single inference per frame.")
+    else:
+        try:
+            ball_model = YOLO(resolved_ball_path)
+        except Exception as exc:
+            print(f"Failed to load ball model '{resolved_ball_path}' ({exc}); "
+                  f"using {FALLBACK_BALL_MODEL}")
+            ball_model = YOLO(FALLBACK_BALL_MODEL)
     ball_class_id = resolve_ball_class_id(ball_model)
 
     ellipse_annotator = triangle_annotator = label_annotator = None
@@ -312,7 +348,8 @@ def track(video_path, output_dir,
 
     team_classifier = None
     if track_teams:
-        team_classifier = generate_team_model(video_path, player_model, stride=stride)
+        team_classifier = generate_team_model(
+            video_path, player_model, player_class_ids=player_class_ids, stride=stride)
 
     video_info = sv.VideoInfo.from_video_path(video_path=video_path)
     frame_w, frame_h = video_info.width, video_info.height
@@ -327,13 +364,21 @@ def track(video_path, output_dir,
     if sink:
         sink.__enter__()
 
+    shared_conf = min(DEFAULT_PLAYER_CONF, ball_conf)
     for frame in tqdm(frame_generator, desc="Collecting Tracking Data..."):
-        player_result = player_model(frame, conf=DEFAULT_PLAYER_CONF, verbose=False)[0]
-        ball_result = ball_model(frame, conf=ball_conf, verbose=False)[0]
+        if share_model:
+            # One pass at the lower confidence; players are re-thresholded in
+            # get_detections so their behaviour is unchanged.
+            result = player_model(frame, conf=shared_conf, verbose=False)[0]
+            player_result = ball_result = result
+        else:
+            player_result = player_model(frame, conf=DEFAULT_PLAYER_CONF, verbose=False)[0]
+            ball_result = ball_model(frame, conf=ball_conf, verbose=False)[0]
 
         all_detections, ball_detections = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
-            ball_class_id=ball_class_id)
+            ball_class_id=ball_class_id, player_class_ids=player_class_ids,
+            player_conf=DEFAULT_PLAYER_CONF)
 
         object_ids = all_detections.tracker_id
         team_ids = all_detections.class_id
@@ -390,7 +435,9 @@ def parse_args():
     parser.add_argument("--video", required=True, help="Path to the input .mp4 footage.")
     parser.add_argument("--output", default="./track/output", help="Directory for the tracking CSV.")
     parser.add_argument("--player-model", default=DEFAULT_PLAYER_MODEL,
-                        help="Ultralytics weights for player detection (default yolov8n.pt).")
+                        help="Weights for player detection. 'football' (default) downloads a "
+                             "football-trained model from the HF Hub (fallback yolov8n.pt); "
+                             "or pass a path to a .pt file.")
     parser.add_argument("--ball-model", default=DEFAULT_BALL_MODEL,
                         help="Weights for ball detection. 'football' (default) downloads a "
                              "football-trained model from the HF Hub (fallback yolov8m.pt); "
