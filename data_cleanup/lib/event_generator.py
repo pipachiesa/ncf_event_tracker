@@ -49,6 +49,17 @@ SAME_PLAYER_MERGE_GAP = 12
 # ball going out of play / a shot in the gap.
 MIN_FLIGHT_FRAMES = 1
 
+# A gap between possessions counts as a stoppage ("out of play") only if the
+# ball is *continuously* undetected for at least this many seconds. A real dead
+# ball (throw-in, goal kick, corner) stays gone for several seconds; brief,
+# intermittent detection misses -- the norm with YOLO tracking, where the ball
+# is only found in a fraction of frames -- must NOT be read as the ball leaving
+# play, or nearly every possession change becomes a phantom SET PIECE. Lower it
+# for clean tracking sources (e.g. Metrica) where the ball is blanked only when
+# genuinely dead. Tune via ``generate_events(long_blank_seconds=...)``.
+LONG_BLANK_SECONDS_RAW = 3.0
+LONG_BLANK_SECONDS_CLEAN = 1.0
+
 # A pass at least this long (metres) is flagged as a LONG BALL.
 LONG_BALL_M = 32.0
 
@@ -64,13 +75,24 @@ AERIAL_MIN_FLIGHT_FRAMES = 8
 
 
 class EventGenerator():
-    def __init__(self, match, possession_radius=POSSESSION_RADIUS_M):
+    def __init__(self, match, possession_radius=POSSESSION_RADIUS_M,
+                 long_blank_seconds=None):
         self.match = match
         self.source = match.source
         self.possession_radius = possession_radius
+        # Seconds of *continuous* ball-blank that count as the ball going out of
+        # play. Defaults higher for noisy "raw" YOLO data than for clean sources.
+        if long_blank_seconds is None:
+            long_blank_seconds = (LONG_BLANK_SECONDS_RAW if self.source == "raw"
+                                  else LONG_BLANK_SECONDS_CLEAN)
+        self.long_blank_seconds = long_blank_seconds
         self.possessions = []
         # attacking goal x (0 or 1) per normalised team key
         self.attack_goal = {}
+
+    def long_blank_frames(self):
+        """Continuous ball-less frames needed to call the ball out of play."""
+        return max(1, int(round(self.long_blank_seconds * self.match_fps())))
 
     # ------------------------------------------------------------------ #
     # Public entry point                                                 #
@@ -306,6 +328,8 @@ class EventGenerator():
 
         flight_frames = max(end_frame - start_frame - 1, 0)
         went_none = False
+        max_blank_run = 0     # longest run of *consecutive* ball-less frames
+        cur_blank_run = 0
         out_norm = None  # last in/near-bounds ball position before going out
         ball_path = []
         for fn in range(start_frame, end_frame + 1):
@@ -315,7 +339,11 @@ class EventGenerator():
             ball = self._norm_ball(moment)
             if ball is None:
                 went_none = True
+                cur_blank_run += 1
+                if cur_blank_run > max_blank_run:
+                    max_blank_run = cur_blank_run
                 continue
+            cur_blank_run = 0
             ball_path.append((fn, ball))
 
         start_loc = a.end_loc
@@ -327,9 +355,11 @@ class EventGenerator():
             if pitch.is_out_of_bounds(ball, margin=0.0):
                 out_of_bounds = True
                 out_norm = ball
-        # A long stretch with no ball detection across a stoppage also implies
-        # the ball went out of play (Metrica blanks the ball when it is dead).
-        long_blank = went_none and flight_frames >= self.match_fps()
+        # A *continuous* stretch with no ball detection implies the ball went
+        # out of play. We require a sustained blank (``long_blank_frames``) so
+        # that the constant brief misses of YOLO tracking don't masquerade as
+        # stoppages and inflate SET PIECE / BALL LOST OUT counts.
+        long_blank = max_blank_run >= self.long_blank_frames()
 
         out_of_play = out_of_bounds or long_blank
 

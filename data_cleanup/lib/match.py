@@ -220,14 +220,20 @@ class Match():
         self.current_frame = 1
         return self.frame(self.current_frame)
     
-    def generate_events(self, possession_radius=POSSESSION_RADIUS_M):
+    def generate_events(self, possession_radius=POSSESSION_RADIUS_M,
+                        long_blank_seconds=None):
         """Generate footballing event data from this match's tracking data.
 
         Returns an ``EventLog`` containing the detected passes, balls lost,
         recoveries, shots, goals, set pieces and challenges. See
         ``lib/event_generator.py`` for the methodology.
+
+        ``long_blank_seconds`` controls how many seconds of *continuous* ball
+        blank count as the ball going out of play (raises = fewer phantom set
+        pieces). Defaults to 3s for raw tracking, 1s for clean sources.
         """
-        generator = EventGenerator(self, possession_radius=possession_radius)
+        generator = EventGenerator(self, possession_radius=possession_radius,
+                                   long_blank_seconds=long_blank_seconds)
         self.event_generator = generator
         return generator.generate()
 
