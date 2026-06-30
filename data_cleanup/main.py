@@ -92,7 +92,7 @@ FOOTBALL_MODEL_REPO = "uisikdag/yolo-v8-football-players-detection"
 FOOTBALL_MODEL_FILE = "best.pt"
 
 # The ball is small and easily missed; keep its confidence low.
-DEFAULT_BALL_CONF = 0.15
+DEFAULT_BALL_CONF = 0.10
 DEFAULT_PLAYER_CONF = 0.3
 
 # Linearly interpolate ball position across detection gaps no longer than this
@@ -104,7 +104,7 @@ BALL_INTERP_MAX_GAP = 15
 # dropping it; a longer buffer reuses the same id across occlusions/missed
 # detections instead of minting a fresh id on every reappearance (which
 # fragmented players into thousands of short-lived ids).
-DEFAULT_LOST_TRACK_BUFFER = 90
+DEFAULT_LOST_TRACK_BUFFER = 150
 
 # Player tracks shorter than this many frames are treated as detector/tracker
 # noise and discarded before event generation.
@@ -209,6 +209,12 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     # Ball: filter to the model's ball class (0 for football models, 32 for COCO).
     ball_all = sv.Detections.from_ultralytics(ball_result)
     ball_detections = ball_all[ball_all.class_id == ball_class_id]
+    # The ball is unique: at low confidence several boxes can fire, so keep only
+    # the single most confident one (a stray false positive must not replace the
+    # real ball).
+    if len(ball_detections) > 1 and ball_detections.confidence is not None:
+        best = int(np.argmax(ball_detections.confidence))
+        ball_detections = ball_detections[best:best + 1]
 
     players_detections.data["pitch_xy"] = image_to_pitch(players_detections, frame_w, frame_h)
     ball_detections.data["pitch_xy"] = image_to_pitch(ball_detections, frame_w, frame_h)
