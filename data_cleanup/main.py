@@ -100,6 +100,16 @@ DEFAULT_PLAYER_CONF = 0.3
 # every missed detection.
 BALL_INTERP_MAX_GAP = 15
 
+# ByteTrack keeps a "lost" player track alive for this many frames before
+# dropping it; a longer buffer reuses the same id across occlusions/missed
+# detections instead of minting a fresh id on every reappearance (which
+# fragmented players into thousands of short-lived ids).
+DEFAULT_LOST_TRACK_BUFFER = 90
+
+# Player tracks shorter than this many frames are treated as detector/tracker
+# noise and discarded before event generation.
+DEFAULT_MIN_TRACK_FRAMES = 12
+
 # COCO class ids produced by the stock yolov8 weights.
 COCO_PERSON = 0
 COCO_SPORTS_BALL = 32
@@ -275,6 +285,19 @@ def interpolate_ball(ball, total_frames, max_gap=BALL_INTERP_MAX_GAP):
     return filled
 
 
+def drop_short_tracks(players, min_frames):
+    """Remove player tracks present in fewer than ``min_frames`` frames.
+
+    Returns ``(kept_players, dropped_count)``. These ultra-short tracks are the
+    fragments ByteTrack mints when it loses and re-IDs a player; dropping them
+    cuts phantom turnovers in the events without touching real players.
+    """
+    if min_frames <= 1:
+        return players, 0
+    kept = {pid: data for pid, data in players.items() if len(data) >= min_frames}
+    return kept, len(players) - len(kept)
+
+
 def save_tracking_results(players, ball, frames, output_path):
     csv = "Frame,Object,Object ID,Team,X1,Y1,X2,Y2,X_Pitch,Y_Pitch\n"
     for frame in range(1, frames):
@@ -302,6 +325,8 @@ def track(video_path, output_dir,
           player_model_path=DEFAULT_PLAYER_MODEL,
           ball_model_path=DEFAULT_BALL_MODEL,
           ball_conf=DEFAULT_BALL_CONF, ball_interp_gap=BALL_INTERP_MAX_GAP,
+          track_buffer=DEFAULT_LOST_TRACK_BUFFER,
+          min_track_frames=DEFAULT_MIN_TRACK_FRAMES,
           track_teams=True, generate_video=False, stride=30):
     import supervision as sv
     from ultralytics import YOLO
@@ -343,7 +368,15 @@ def track(video_path, output_dir,
         triangle_annotator = sv.TriangleAnnotator(
             color=sv.Color.from_hex('#FFD700'), base=25, height=21, outline_thickness=1)
 
-    tracker = sv.ByteTrack()
+    video_info = sv.VideoInfo.from_video_path(video_path=video_path)
+    frame_w, frame_h = video_info.width, video_info.height
+    fps = int(round(video_info.fps)) or 24
+
+    # Longer lost-track buffer => fewer fragmented ids across occlusions.
+    try:
+        tracker = sv.ByteTrack(lost_track_buffer=track_buffer, frame_rate=fps)
+    except TypeError:  # older supervision signature without these kwargs
+        tracker = sv.ByteTrack()
     tracker.reset()
 
     team_classifier = None
@@ -351,8 +384,6 @@ def track(video_path, output_dir,
         team_classifier = generate_team_model(
             video_path, player_model, player_class_ids=player_class_ids, stride=stride)
 
-    video_info = sv.VideoInfo.from_video_path(video_path=video_path)
-    frame_w, frame_h = video_info.width, video_info.height
     frame_generator = sv.get_video_frames_generator(video_path)
 
     players, ball = {}, {}
@@ -419,6 +450,12 @@ def track(video_path, output_dir,
     if sink:
         sink.__exit__(None, None, None)
 
+    # Drop fragmented (ultra-short) player tracks before events.
+    players, dropped = drop_short_tracks(players, min_track_frames)
+    if dropped:
+        print(f"Dropped {dropped} short player track(s) (< {min_track_frames} frames); "
+              f"{len(players)} tracks kept.")
+
     # Bridge short ball-detection gaps so possession survives a few missed frames.
     filled = interpolate_ball(ball, frame_number - 1, max_gap=ball_interp_gap)
     if filled:
@@ -448,6 +485,11 @@ def parse_args():
     parser.add_argument("--ball-interp-gap", type=int, default=BALL_INTERP_MAX_GAP,
                         help="Max consecutive missed frames to linearly interpolate the ball "
                              "across (default 15).")
+    parser.add_argument("--track-buffer", type=int, default=DEFAULT_LOST_TRACK_BUFFER,
+                        help="ByteTrack lost-track buffer in frames: how long a lost player "
+                             "keeps its id before a new one is minted (default 90).")
+    parser.add_argument("--min-track-frames", type=int, default=DEFAULT_MIN_TRACK_FRAMES,
+                        help="Discard player tracks shorter than this many frames (default 12).")
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
@@ -463,6 +505,8 @@ def main():
         ball_model_path=args.ball_model,
         ball_conf=args.ball_conf,
         ball_interp_gap=args.ball_interp_gap,
+        track_buffer=args.track_buffer,
+        min_track_frames=args.min_track_frames,
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
