@@ -95,6 +95,11 @@ FOOTBALL_MODEL_FILE = "best.pt"
 DEFAULT_BALL_CONF = 0.10
 DEFAULT_PLAYER_CONF = 0.3
 
+# Inference resolution. The ball is tiny, so detecting it at higher resolution
+# (e.g. 1280 instead of the 640 default) recovers many small-object detections
+# the model otherwise misses. Higher = better ball recall but slower.
+DEFAULT_IMGSZ = 1280
+
 # Linearly interpolate ball position across detection gaps no longer than this
 # many frames (longer gaps stay empty). Prevents possession from resetting on
 # every missed detection.
@@ -222,14 +227,15 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     return players_detections, ball_detections
 
 
-def generate_team_model(video_path, player_model, player_class_ids=(COCO_PERSON,), stride=30):
+def generate_team_model(video_path, player_model, player_class_ids=(COCO_PERSON,),
+                        stride=30, imgsz=DEFAULT_IMGSZ):
     import supervision as sv
     from sports.common.team import TeamClassifier
 
     frame_generator = sv.get_video_frames_generator(source_path=video_path, stride=stride)
     crops = []
     for frame in tqdm(frame_generator, desc="collecting crops"):
-        result = player_model(frame, conf=DEFAULT_PLAYER_CONF, verbose=False)[0]
+        result = player_model(frame, conf=DEFAULT_PLAYER_CONF, imgsz=imgsz, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = detections[np.isin(detections.class_id, list(player_class_ids))]
         crops += [sv.crop_image(frame, xyxy) for xyxy in detections.xyxy]
@@ -332,7 +338,7 @@ def track(video_path, output_dir,
           ball_model_path=DEFAULT_BALL_MODEL,
           ball_conf=DEFAULT_BALL_CONF, ball_interp_gap=BALL_INTERP_MAX_GAP,
           track_buffer=DEFAULT_LOST_TRACK_BUFFER,
-          min_track_frames=DEFAULT_MIN_TRACK_FRAMES,
+          min_track_frames=DEFAULT_MIN_TRACK_FRAMES, imgsz=DEFAULT_IMGSZ,
           track_teams=True, generate_video=False, stride=30):
     import supervision as sv
     from ultralytics import YOLO
@@ -388,7 +394,8 @@ def track(video_path, output_dir,
     team_classifier = None
     if track_teams:
         team_classifier = generate_team_model(
-            video_path, player_model, player_class_ids=player_class_ids, stride=stride)
+            video_path, player_model, player_class_ids=player_class_ids,
+            stride=stride, imgsz=imgsz)
 
     frame_generator = sv.get_video_frames_generator(video_path)
 
@@ -406,11 +413,11 @@ def track(video_path, output_dir,
         if share_model:
             # One pass at the lower confidence; players are re-thresholded in
             # get_detections so their behaviour is unchanged.
-            result = player_model(frame, conf=shared_conf, verbose=False)[0]
+            result = player_model(frame, conf=shared_conf, imgsz=imgsz, verbose=False)[0]
             player_result = ball_result = result
         else:
-            player_result = player_model(frame, conf=DEFAULT_PLAYER_CONF, verbose=False)[0]
-            ball_result = ball_model(frame, conf=ball_conf, verbose=False)[0]
+            player_result = player_model(frame, conf=DEFAULT_PLAYER_CONF, imgsz=imgsz, verbose=False)[0]
+            ball_result = ball_model(frame, conf=ball_conf, imgsz=imgsz, verbose=False)[0]
 
         all_detections, ball_detections = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
@@ -496,6 +503,9 @@ def parse_args():
                              "keeps its id before a new one is minted (default 90).")
     parser.add_argument("--min-track-frames", type=int, default=DEFAULT_MIN_TRACK_FRAMES,
                         help="Discard player tracks shorter than this many frames (default 12).")
+    parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ,
+                        help="Inference resolution (default 1280). Higher recovers more small "
+                             "ball detections but is slower; 640 is the fast/low-recall option.")
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
@@ -513,6 +523,7 @@ def main():
         ball_interp_gap=args.ball_interp_gap,
         track_buffer=args.track_buffer,
         min_track_frames=args.min_track_frames,
+        imgsz=args.imgsz,
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
