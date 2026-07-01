@@ -100,6 +100,22 @@ DEFAULT_PLAYER_CONF = 0.3
 # the model otherwise misses. Higher = better ball recall but slower.
 DEFAULT_IMGSZ = 1280
 
+# Pitch keypoint model (YOLOv8-pose, 32 keypoints matching SoccerPitchConfiguration).
+# Enables a real image->pitch homography so event coordinates are true pitch
+# positions instead of a naive camera-perspective scaling. ``"football-field"``
+# downloads the weights from the HF Hub (no API key); ``"none"`` disables
+# homography and falls back to image-space coordinates.
+DEFAULT_PITCH_MODEL = "football-field"
+PITCH_MODEL_REPO = "martinjolif/yolo-football-pitch-detection"
+PITCH_MODEL_FILE = "yolo-football-pitch-detection.pt"
+# Minimum keypoint confidence to use a landmark in the homography, and minimum
+# number of confident landmarks needed to solve one.
+DEFAULT_PITCH_CONF = 0.5
+MIN_HOMOGRAPHY_POINTS = 4
+# Recompute the homography every N frames (the camera pans smoothly, so we reuse
+# the last transform in between to avoid a keypoint pass on every frame).
+DEFAULT_HOMOGRAPHY_EVERY = 5
+
 # Linearly interpolate ball position across detection gaps no longer than this
 # many frames (longer gaps stay empty). Prevents possession from resetting on
 # every missed detection.
@@ -140,6 +156,63 @@ def image_to_pitch(detections, frame_w, frame_h):
     pitch[:, 0] = anchors[:, 0] / frame_w * PITCH_LENGTH_CM
     pitch[:, 1] = anchors[:, 1] / frame_h * PITCH_WIDTH_CM
     return pitch
+
+
+def resolve_pitch_model_path(spec):
+    """Resolve ``--pitch-model`` to a path, or None to disable homography."""
+    if spec in (None, "none", "None", ""):
+        return None
+    if spec != "football-field":
+        return spec
+    try:
+        from huggingface_hub import hf_hub_download
+
+        path = hf_hub_download(repo_id=PITCH_MODEL_REPO, filename=PITCH_MODEL_FILE)
+        print(f"Using pitch keypoint model {PITCH_MODEL_REPO} (homography enabled)")
+        return path
+    except Exception as exc:
+        print(f"Could not fetch pitch model ({exc}); using image-space coords (no homography)")
+        return None
+
+
+def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
+                            min_points=MIN_HOMOGRAPHY_POINTS):
+    """Build an image->pitch ``ViewTransformer`` from detected pitch keypoints.
+
+    Returns the transformer, or None when too few confident landmarks were
+    found to solve a homography (caller then reuses the last good transform).
+    """
+    import supervision as sv
+    try:
+        from sports.configs.soccer import SoccerPitchConfiguration
+        from sports.common.view import ViewTransformer
+    except Exception:
+        return None
+
+    key_points = sv.KeyPoints.from_ultralytics(pitch_result)
+    if key_points.xy is None or len(key_points.xy) == 0 or key_points.confidence is None:
+        return None
+    conf = key_points.confidence[0]
+    mask = conf > min_conf
+    if int(mask.sum()) < min_points:
+        return None
+
+    frame_pts = key_points.xy[0][mask].astype(np.float32)
+    pitch_pts = np.array(SoccerPitchConfiguration().vertices)[mask].astype(np.float32)
+    try:
+        return ViewTransformer(source=frame_pts, target=pitch_pts)
+    except Exception:
+        return None
+
+
+def anchors_to_pitch(detections, transformer):
+    """Project detection anchors to pitch coords via a homography transform."""
+    import supervision as sv
+
+    if len(detections) == 0:
+        return np.zeros((0, 2))
+    xy = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER).astype(np.float32)
+    return transformer.transform_points(points=xy).astype(float)
 
 
 def resolve_model_path(spec, fallback):
@@ -192,8 +265,14 @@ def resolve_player_class_ids(model):
 
 def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL,
-                   player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF):
+                   player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF,
+                   transformer=None):
     import supervision as sv
+
+    def to_pitch(dets):
+        if transformer is not None:
+            return anchors_to_pitch(dets, transformer)
+        return image_to_pitch(dets, frame_w, frame_h)
 
     # Players: keep the player/goalkeeper classes (drop ball & referee). When a
     # single shared model is run at the low ball confidence, also drop player
@@ -221,8 +300,8 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
         best = int(np.argmax(ball_detections.confidence))
         ball_detections = ball_detections[best:best + 1]
 
-    players_detections.data["pitch_xy"] = image_to_pitch(players_detections, frame_w, frame_h)
-    ball_detections.data["pitch_xy"] = image_to_pitch(ball_detections, frame_w, frame_h)
+    players_detections.data["pitch_xy"] = to_pitch(players_detections)
+    ball_detections.data["pitch_xy"] = to_pitch(ball_detections)
 
     return players_detections, ball_detections
 
@@ -339,6 +418,8 @@ def track(video_path, output_dir,
           ball_conf=DEFAULT_BALL_CONF, ball_interp_gap=BALL_INTERP_MAX_GAP,
           track_buffer=DEFAULT_LOST_TRACK_BUFFER,
           min_track_frames=DEFAULT_MIN_TRACK_FRAMES, imgsz=DEFAULT_IMGSZ,
+          pitch_model_path=DEFAULT_PITCH_MODEL, pitch_conf=DEFAULT_PITCH_CONF,
+          homography_every=DEFAULT_HOMOGRAPHY_EVERY,
           track_teams=True, generate_video=False, stride=30):
     import supervision as sv
     from ultralytics import YOLO
@@ -369,6 +450,17 @@ def track(video_path, output_dir,
                   f"using {FALLBACK_BALL_MODEL}")
             ball_model = YOLO(FALLBACK_BALL_MODEL)
     ball_class_id = resolve_ball_class_id(ball_model)
+
+    # Pitch keypoint model for homography (optional; falls back to image space).
+    pitch_model = None
+    resolved_pitch_path = resolve_pitch_model_path(pitch_model_path)
+    if resolved_pitch_path:
+        try:
+            pitch_model = YOLO(resolved_pitch_path)
+        except Exception as exc:
+            print(f"Failed to load pitch model '{resolved_pitch_path}' ({exc}); "
+                  f"using image-space coords (no homography)")
+            pitch_model = None
 
     ellipse_annotator = triangle_annotator = label_annotator = None
     if generate_video:
@@ -401,6 +493,7 @@ def track(video_path, output_dir,
 
     players, ball = {}, {}
     frame_number = 1
+    transformer = None  # most recent image->pitch homography
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     annotated_video_path = os.path.join(output_dir, video_name + "_tracked.mp4")
@@ -419,10 +512,19 @@ def track(video_path, output_dir,
             player_result = player_model(frame, conf=DEFAULT_PLAYER_CONF, imgsz=imgsz, verbose=False)[0]
             ball_result = ball_model(frame, conf=ball_conf, imgsz=imgsz, verbose=False)[0]
 
+        # Refresh the homography every ``homography_every`` frames; reuse the
+        # last good transform in between (and keep it if a frame has too few
+        # keypoints to solve a new one).
+        if pitch_model is not None and (frame_number - 1) % homography_every == 0:
+            pitch_result = pitch_model(frame, imgsz=imgsz, verbose=False)[0]
+            new_transformer = build_pitch_transformer(pitch_result, min_conf=pitch_conf)
+            if new_transformer is not None:
+                transformer = new_transformer
+
         all_detections, ball_detections = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
             ball_class_id=ball_class_id, player_class_ids=player_class_ids,
-            player_conf=DEFAULT_PLAYER_CONF)
+            player_conf=DEFAULT_PLAYER_CONF, transformer=transformer)
 
         object_ids = all_detections.tracker_id
         team_ids = all_detections.class_id
@@ -506,6 +608,14 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ,
                         help="Inference resolution (default 1280). Higher recovers more small "
                              "ball detections but is slower; 640 is the fast/low-recall option.")
+    parser.add_argument("--pitch-model", default=DEFAULT_PITCH_MODEL,
+                        help="Pitch keypoint model for homography. 'football-field' (default) "
+                             "downloads it from the HF Hub; 'none' disables homography and uses "
+                             "image-space coords; or pass a path to a .pt file.")
+    parser.add_argument("--pitch-conf", type=float, default=DEFAULT_PITCH_CONF,
+                        help="Min keypoint confidence used in the homography (default 0.5).")
+    parser.add_argument("--homography-every", type=int, default=DEFAULT_HOMOGRAPHY_EVERY,
+                        help="Recompute the homography every N frames (default 5).")
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
@@ -524,6 +634,9 @@ def main():
         track_buffer=args.track_buffer,
         min_track_frames=args.min_track_frames,
         imgsz=args.imgsz,
+        pitch_model_path=args.pitch_model,
+        pitch_conf=args.pitch_conf,
+        homography_every=args.homography_every,
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
