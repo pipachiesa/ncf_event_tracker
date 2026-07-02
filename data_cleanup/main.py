@@ -116,6 +116,11 @@ MIN_HOMOGRAPHY_POINTS = 4
 # the last transform in between to avoid a keypoint pass on every frame).
 DEFAULT_HOMOGRAPHY_EVERY = 5
 
+# Pitch keypoints are large features and gain nothing from very high resolution,
+# so the pitch model is capped here even when players/ball run at a higher imgsz
+# (keeps precision where it matters without paying the cost where it doesn't).
+DEFAULT_PITCH_IMGSZ = 1280
+
 # Linearly interpolate ball position across detection gaps no longer than this
 # many frames (longer gaps stay empty). Prevents possession from resetting on
 # every missed detection.
@@ -425,7 +430,7 @@ def track(video_path, output_dir,
           track_buffer=DEFAULT_LOST_TRACK_BUFFER,
           min_track_frames=DEFAULT_MIN_TRACK_FRAMES, imgsz=DEFAULT_IMGSZ,
           pitch_model_path=DEFAULT_PITCH_MODEL, pitch_conf=DEFAULT_PITCH_CONF,
-          homography_every=DEFAULT_HOMOGRAPHY_EVERY,
+          homography_every=DEFAULT_HOMOGRAPHY_EVERY, pitch_imgsz=DEFAULT_PITCH_IMGSZ,
           track_teams=True, generate_video=False, stride=30):
     import supervision as sv
     from ultralytics import YOLO
@@ -522,7 +527,7 @@ def track(video_path, output_dir,
         # last good transform in between (and keep it if a frame has too few
         # keypoints to solve a new one).
         if pitch_model is not None and (frame_number - 1) % homography_every == 0:
-            pitch_result = pitch_model(frame, imgsz=imgsz, verbose=False)[0]
+            pitch_result = pitch_model(frame, imgsz=min(pitch_imgsz, imgsz), verbose=False)[0]
             new_transformer = build_pitch_transformer(pitch_result, min_conf=pitch_conf)
             if new_transformer is not None:
                 transformer = new_transformer
@@ -622,6 +627,9 @@ def parse_args():
                         help="Min keypoint confidence used in the homography (default 0.5).")
     parser.add_argument("--homography-every", type=int, default=DEFAULT_HOMOGRAPHY_EVERY,
                         help="Recompute the homography every N frames (default 5).")
+    parser.add_argument("--pitch-imgsz", type=int, default=DEFAULT_PITCH_IMGSZ,
+                        help="Resolution cap for the pitch keypoint model (default 1280); kept "
+                             "lower than --imgsz since field landmarks don't need high res.")
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
@@ -643,6 +651,7 @@ def main():
         pitch_model_path=args.pitch_model,
         pitch_conf=args.pitch_conf,
         homography_every=args.homography_every,
+        pitch_imgsz=args.pitch_imgsz,
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
