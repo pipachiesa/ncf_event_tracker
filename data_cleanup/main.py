@@ -390,25 +390,31 @@ def drop_short_tracks(players, min_frames):
 
 
 def save_tracking_results(players, ball, frames, output_path):
-    csv = "Frame,Object,Object ID,Team,X1,Y1,X2,Y2,X_Pitch,Y_Pitch\n"
+    # Bucket player rows by frame in a single pass, then emit in frame order.
+    # This is linear in the number of rows; the previous ``csv += ...`` in a
+    # double loop was O(frames x players) with O(n^2) string growth, which
+    # stalls on full 90-minute matches (~millions of rows).
+    by_frame = {}
+    for player_id, player_data in players.items():
+        for f_str, d in player_data.items():
+            by_frame.setdefault(int(f_str), []).append(",".join(map(str, [
+                int(f_str), "player", player_id, d["Team"],
+                d["X1"], d["Y1"], d["X2"], d["Y2"], d["X_Pitch"], d["Y_Pitch"],
+            ])))
+
+    rows = ["Frame,Object,Object ID,Team,X1,Y1,X2,Y2,X_Pitch,Y_Pitch"]
     for frame in range(1, frames):
-        for player_id, player_data in players.items():
-            if str(frame) in player_data:
-                d = player_data[str(frame)]
-                csv += ",".join(map(str, [
-                    frame, "player", player_id, d["Team"],
-                    d["X1"], d["Y1"], d["X2"], d["Y2"], d["X_Pitch"], d["Y_Pitch"],
-                ])) + "\n"
+        rows.extend(by_frame.get(frame, []))
         if str(frame) in ball:
             d = ball[str(frame)]
-            csv += ",".join(map(str, [
+            rows.append(",".join(map(str, [
                 frame, "ball", "", "",
                 d["X1"], d["Y1"], d["X2"], d["Y2"], d["X_Pitch"], d["Y_Pitch"],
-            ])) + "\n"
+            ])))
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w") as f:
-        f.write(csv)
+        f.write("\n".join(rows) + "\n")
     return output_path
 
 
