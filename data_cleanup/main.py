@@ -145,6 +145,27 @@ COCO_SPORTS_BALL = 32
 PITCH_LENGTH_CM = 12000.0
 PITCH_WIDTH_CM = 7000.0
 
+# On frames with few/poor pitch keypoints the homography extrapolates wildly and
+# sends detections far off the pitch. These margins (fractions of pitch size)
+# bound that noise: the ball is dropped (and later interpolated) when beyond
+# BALL, players are clamped into the PLAYER band.
+BALL_PITCH_MARGIN = 0.10
+PLAYER_PITCH_MARGIN = 0.15
+
+
+def _pitch_in_bounds(xy, margin):
+    return (-margin * PITCH_LENGTH_CM <= xy[0] <= (1 + margin) * PITCH_LENGTH_CM and
+            -margin * PITCH_WIDTH_CM <= xy[1] <= (1 + margin) * PITCH_WIDTH_CM)
+
+
+def _clamp_pitch(arr, margin):
+    if len(arr) == 0:
+        return arr
+    arr = np.asarray(arr, dtype=float).copy()
+    arr[:, 0] = np.clip(arr[:, 0], -margin * PITCH_LENGTH_CM, (1 + margin) * PITCH_LENGTH_CM)
+    arr[:, 1] = np.clip(arr[:, 1], -margin * PITCH_WIDTH_CM, (1 + margin) * PITCH_WIDTH_CM)
+    return arr
+
 
 def image_to_pitch(detections, frame_w, frame_h):
     """Project detections to (approximate) pitch coordinates from image space.
@@ -305,8 +326,22 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
         best = int(np.argmax(ball_detections.confidence))
         ball_detections = ball_detections[best:best + 1]
 
-    players_detections.data["pitch_xy"] = to_pitch(players_detections)
-    ball_detections.data["pitch_xy"] = to_pitch(ball_detections)
+    # Clamp players into a sane band so homography noise doesn't scatter events
+    # far outside the pitch.
+    players_pitch = to_pitch(players_detections)
+    if transformer is not None:
+        players_pitch = _clamp_pitch(players_pitch, PLAYER_PITCH_MARGIN)
+    players_detections.data["pitch_xy"] = players_pitch
+
+    # Drop the ball on frames where the homography sends it wildly off the pitch
+    # (bad keypoints): leaving it empty lets interpolation bridge the gap instead
+    # of producing a phantom out-of-bounds SET PIECE.
+    ball_pitch = to_pitch(ball_detections)
+    if (transformer is not None and len(ball_detections)
+            and not _pitch_in_bounds(ball_pitch[0], BALL_PITCH_MARGIN)):
+        ball_detections = ball_detections[0:0]
+        ball_pitch = ball_pitch[0:0]
+    ball_detections.data["pitch_xy"] = ball_pitch
 
     return players_detections, ball_detections
 
