@@ -496,9 +496,17 @@ def track(video_path, output_dir,
 
     team_classifier = None
     if track_teams:
-        team_classifier = generate_team_model(
-            video_path, player_model, player_class_ids=player_class_ids,
-            stride=stride, imgsz=imgsz)
+        try:
+            team_classifier = generate_team_model(
+                video_path, player_model, player_class_ids=player_class_ids,
+                stride=stride, imgsz=imgsz)
+        except Exception as exc:
+            # The team classifier pulls a heavy umap/numba stack that can clash
+            # with the runtime's NumPy. Degrade gracefully instead of crashing:
+            # tracking still runs, players just aren't split into teams.
+            print(f"⚠️  Team classifier unavailable ({exc}); continuing WITHOUT "
+                  f"team labels (events will be less detailed).")
+            team_classifier = None
 
     frame_generator = sv.get_video_frames_generator(video_path)
 
