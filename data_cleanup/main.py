@@ -295,11 +295,6 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    transformer=None):
     import supervision as sv
 
-    def to_pitch(dets):
-        if transformer is not None:
-            return anchors_to_pitch(dets, transformer)
-        return image_to_pitch(dets, frame_w, frame_h)
-
     # Players: keep the player/goalkeeper classes (drop ball & referee). When a
     # single shared model is run at the low ball confidence, also drop player
     # boxes below ``player_conf`` so player behaviour stays unchanged.
@@ -326,21 +321,34 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
         best = int(np.argmax(ball_detections.confidence))
         ball_detections = ball_detections[best:best + 1]
 
-    # Clamp players into a sane band so homography noise doesn't scatter events
-    # far outside the pitch.
-    players_pitch = to_pitch(players_detections)
-    if transformer is not None:
-        players_pitch = _clamp_pitch(players_pitch, PLAYER_PITCH_MARGIN)
-    players_detections.data["pitch_xy"] = players_pitch
+    # Project to pitch coords. Image-space is always on-pitch but approximate;
+    # the homography is accurate but goes wild on bad-keypoint frames. So: keep
+    # the (approximate) image-space projection as a safety net and only use the
+    # homography when it's trustworthy for this frame -- never dropping the ball.
+    img_players = image_to_pitch(players_detections, frame_w, frame_h)
+    img_ball = image_to_pitch(ball_detections, frame_w, frame_h)
 
-    # Drop the ball on frames where the homography sends it wildly off the pitch
-    # (bad keypoints): leaving it empty lets interpolation bridge the gap instead
-    # of producing a phantom out-of-bounds SET PIECE.
-    ball_pitch = to_pitch(ball_detections)
-    if (transformer is not None and len(ball_detections)
-            and not _pitch_in_bounds(ball_pitch[0], BALL_PITCH_MARGIN)):
-        ball_detections = ball_detections[0:0]
-        ball_pitch = ball_pitch[0:0]
+    if transformer is None:
+        players_pitch, ball_pitch = img_players, img_ball
+    else:
+        h_players = anchors_to_pitch(players_detections, transformer)
+        h_ball = anchors_to_pitch(ball_detections, transformer)
+        # If many players land off the pitch, the homography is unreliable this
+        # frame -> fall back to image-space for everything (keeps it consistent).
+        off_frac = (float(np.mean([not _pitch_in_bounds(p, PLAYER_PITCH_MARGIN)
+                                   for p in h_players])) if len(h_players) else 0.0)
+        if off_frac > 0.3:
+            players_pitch, ball_pitch = img_players, img_ball
+        else:
+            players_pitch = _clamp_pitch(h_players, PLAYER_PITCH_MARGIN)
+            # Keep the ball; if its homography point is wild, use image-space
+            # (approximate) instead of discarding the detection.
+            if len(h_ball) and not _pitch_in_bounds(h_ball[0], BALL_PITCH_MARGIN):
+                ball_pitch = img_ball
+            else:
+                ball_pitch = h_ball
+
+    players_detections.data["pitch_xy"] = players_pitch
     ball_detections.data["pitch_xy"] = ball_pitch
 
     return players_detections, ball_detections
