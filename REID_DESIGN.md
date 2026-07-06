@@ -67,7 +67,17 @@ La idea funciona y es segura en conteo. **Pero "0 overlaps" es necesario, no suf
 ## Estado de tareas
 1. ✅ Branch `reid` + baseline + clip de validación.
 2. ✅ Spike: enfoque B decidido (este doc).
-3. ⬜ Extraer descriptores por track (CSV + video).
-4. ⬜ Implementar el merge (union-find, 5 gates).
-5. ⬜ Tunear umbrales + validar (visual + eventos).
-6. ⬜ Integrar en el notebook + comparar + merge a `main`.
+3. ✅ Extraer descriptores por track (CSV + video) — `data_cleanup/reid.py`.
+4. ✅ Implementar el merge (union-find, 5 gates).
+5. ✅ Tunear umbrales + validar visual (crops de junctions + video pintado) sobre el clip baseline.
+6. 🔶 Integrado en el notebook (celda 5b + chequeo); falta comparar eventos y merge a `main`.
+
+## Resultados de la implementación (clip baseline, local en CPU)
+- **187 → 106 IDs** con los defaults (`tmax=30s, dmax=800, smin=0.30`), **0 solapamientos**, ~30 s de corrida.
+- Detalles que sumó la implementación sobre el diseño original:
+  - Radio espacial que crece con el gap (`800 + 600·gap_s` cm, tope 3500) — un jugador sin trackear se sigue moviendo; el Dmax fijo del diseño bloqueaba casi todo.
+  - Crops elegidos por **nitidez** (varianza del Laplaciano): los fragmentos mueren justo en los paneos, y los crops borrosos envenenaban el histograma.
+  - Apariencia en **dos niveles**: veto duro `smin=0.30` siempre + evidencia positiva `≥0.45` para gaps >5 s (inverificables por movimiento).
+  - **Veto local de junction** (últimos/primeros ~2 s de cada fragmento, umbral 0.15): caza fragmentos que "derivan" a otro jugador antes de morir (el descriptor global miente en el borde).
+- **Techo honesto:** bajar de ~100 en este clip exige merges que la verificación visual mostró incorrectos (el histograma HSV no distingue compañeros). Para llegar a 40-70: embeddings (SigLIP del team classifier u OSNet), que era la "mejora futura" prevista.
+- El "0 solapamientos" queda garantizado por construcción (gate 1 sobre grupos); la validación real es visual: `--render check.mp4` pinta los tracks fusionados, y hay planchas de crops por junction para auditar merges.
