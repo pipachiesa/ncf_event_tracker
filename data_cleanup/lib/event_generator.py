@@ -37,8 +37,11 @@ POSSESSION_RADIUS_M = 3.0
 MIN_POSSESSION_FRAMES = 3
 
 # A short opposition possession sandwiched between two possessions of the same
-# player, lasting no more than this many frames, is treated as a failed tackle
-# and removed.
+# TEAM, lasting no more than this many frames, is treated as a failed tackle /
+# deflection and removed. (Same player: a failed tackle; same team: the ball
+# grazed an opponent on its way between teammates.) Without this, every
+# contested ball reads as two turnovers -- a phantom BALL LOST + RECOVERY pair
+# in each direction.
 FAILED_TACKLE_MAX_FRAMES = 9
 
 # Same-player possessions separated by no more than this gap are merged (the
@@ -60,6 +63,11 @@ MIN_FLIGHT_FRAMES = 1
 LONG_BLANK_SECONDS_RAW = 3.0
 LONG_BLANK_SECONDS_CLEAN = 1.0
 
+# A possession hand-off between teammates only counts as a PASS when the ball
+# travelled at least this far (metres). Below it, the "pass" is the possession
+# radius flapping between two players standing next to each other.
+PASS_MIN_TRAVEL_M = 2.0
+
 # A pass at least this long (metres) is flagged as a LONG BALL.
 LONG_BALL_M = 32.0
 
@@ -72,6 +80,35 @@ FINAL_THIRD = 1.0 / 3.0
 # the ball was lost in flight, are treated as an aerial challenge.
 CHALLENGE_RADIUS_M = 4.0
 AERIAL_MIN_FLIGHT_FRAMES = 8
+
+# Region in front of the goal that a goalward ball must reach to count as a
+# shot: slightly wider than the literal goal mouth (a saved shot dies at the
+# keeper, a couple of metres off the line / off-centre), but deliberately NOT
+# the whole box -- long clearances routinely drift into the penalty area and
+# must not read as shots.
+SHOT_AREA_DEPTH = 0.07
+SHOT_AREA_HALF_WIDTH = 0.09
+
+# A shot must also START within plausible shooting range of the goal. The
+# false positives on real footage are long balls / clearances from midfield
+# that drift goalward and are gathered by the keeper (or run out near the
+# goal); those "shots" start 50+ m out. 40 m covers all but freak long-range
+# attempts.
+SHOT_MAX_START_DIST_M = 40.0
+
+# A change of possession only counts as a turnover (BALL LOST + RECOVERY) when
+# the recovering possession holds the ball at least this many frames. A
+# shorter touch is the possession radius flapping between two nearby players
+# (or a graze), not a real recovery -- emitting nothing is safer than a
+# phantom turnover pair.
+TURNOVER_MIN_HOLD_FRAMES = 6
+
+# BALL LOST is subtyped INTERCEPTION only when the ball actually travelled
+# loose for at least this many frames before the opponent won it (i.e. a pass
+# or clearance was cut out mid-flight). Adjacent-possession steals are plain
+# BALL LOST. The old threshold (1 frame) labelled nearly every noisy exchange
+# an interception.
+INTERCEPTION_MIN_FLIGHT_FRAMES = 4
 
 
 class EventGenerator():
@@ -191,7 +228,7 @@ class EventGenerator():
                 nxt = possessions[i + 1]
                 is_failed_tackle = (
                     curr.duration <= FAILED_TACKLE_MAX_FRAMES
-                    and prev.same_player(nxt)
+                    and prev.same_team(nxt)
                     and not curr.same_team(prev)
                 )
                 if is_failed_tackle:
@@ -304,9 +341,10 @@ class EventGenerator():
 
         # --- Continuous play -------------------------------------------- #
         if curr.same_team(nxt):
-            if not curr.same_player(nxt):
+            if not curr.same_player(nxt) and self._ball_travelled(curr, nxt):
                 self._emit_pass(curr, nxt, flight, log)
-            # same player after merge shouldn't happen; ignore.
+            # same player after merge, or a hand-off where the ball never
+            # actually travelled (radius noise): no event.
         else:
             # Possession changed teams without the ball leaving play.
             if self._is_aerial_challenge(curr, nxt, flight):
@@ -314,8 +352,10 @@ class EventGenerator():
             elif flight["shot"]:
                 # Goalward, gathered by the opposition keeper -> saved shot.
                 self._emit_shot(curr, nxt, flight, log, is_goal=False, saved=True)
-            else:
+            elif nxt.duration >= TURNOVER_MIN_HOLD_FRAMES:
                 self._emit_turnover(curr, nxt, flight, log)
+            # else: fleeting opposition touch -- not enough evidence of a
+            # real turnover, so no event is emitted.
 
     # ------------------------------------------------------------------ #
     # Gap analysis between two possessions                               #
@@ -377,14 +417,22 @@ class EventGenerator():
                     pitch.distance_m(effective_end, goal_point):
                 effective_end = out_norm
 
-        # Goalward? The ball headed meaningfully towards a's attacking goal.
+        # Goalward? The ball headed meaningfully towards a's attacking goal,
+        # from a position a shot could plausibly be taken from.
         goalward = self._is_goalward(start_loc, effective_end, attacking_goal)
+        in_shot_range = (
+            start_loc is not None and
+            pitch.distance_m(start_loc, goal_point) <= SHOT_MAX_START_DIST_M
+        )
         reached_goal_area = (
-            pitch.near_goal(effective_end, attacking_goal)
-            or (out_norm is not None and pitch.near_goal(out_norm, attacking_goal))
+            pitch.near_goal(effective_end, attacking_goal,
+                            depth=SHOT_AREA_DEPTH, half_width=SHOT_AREA_HALF_WIDTH)
+            or (out_norm is not None and
+                pitch.near_goal(out_norm, attacking_goal,
+                                depth=SHOT_AREA_DEPTH, half_width=SHOT_AREA_HALF_WIDTH))
             or self._crossed_byline_at_goal(ball_path, attacking_goal)
         )
-        shot = goalward and reached_goal_area
+        shot = goalward and in_shot_range and reached_goal_area
 
         # A goal: ball reaches the goal mouth and the next restart is a kick-off
         # from the centre by the conceding team.
@@ -445,6 +493,12 @@ class EventGenerator():
     # ------------------------------------------------------------------ #
     # Event emitters                                                     #
     # ------------------------------------------------------------------ #
+    def _ball_travelled(self, curr, nxt, min_m=PASS_MIN_TRAVEL_M):
+        """True when the ball moved at least ``min_m`` between possessions."""
+        if curr.end_loc is None or nxt.start_loc is None:
+            return True  # can't measure; don't silently drop the event
+        return pitch.distance_m(curr.end_loc, nxt.start_loc) >= min_m
+
     def _emit_pass(self, curr, nxt, flight, log):
         subtype = self._pass_subtype(curr.end_loc, nxt.start_loc, curr.team)
         log.add(Event({
@@ -480,7 +534,7 @@ class EventGenerator():
 
     def _emit_turnover(self, curr, nxt, flight, log):
         """Ball lost to the opposition without leaving the field of play."""
-        intercepted = flight["flight_frames"] >= 1
+        intercepted = flight["flight_frames"] >= INTERCEPTION_MIN_FLIGHT_FRAMES
         log.add(Event({
             "team": curr.team,
             "type": "BALL LOST",
