@@ -3,6 +3,7 @@ from lib.player import Player
 from lib.ball import Ball
 from lib.event_generator import EventGenerator, POSSESSION_RADIUS_M
 import csv
+from collections import Counter
 
 class Match():
     def __init__(self):
@@ -85,6 +86,10 @@ class Match():
         frames = frames[1:]
         
         players = {}
+        # The team classifier labels each frame independently and is noisy
+        # (many tracks flip team mid-track), so a player's team is decided by
+        # majority vote over all their frames -- never by any single frame.
+        team_votes = {}
         for frame in frames:
             frame_number = int(frame[0])
             obj = frame[1]
@@ -117,14 +122,17 @@ class Match():
                         "id" : player_id,
                         "name" : "Player " + str(player_id),
                     })
-                    
+                    team_votes[str(player_id)] = Counter()
+
                 player = players[str(player_id)]
                 player.source = "raw"
                 player.add_frame(frame_data)
+                team_votes[str(player_id)][team] += 1
 
         self.players = []
         for player_id in players:
             player = players[player_id]
+            player.team = team_votes[player_id].most_common(1)[0][0]
             self.players.append(player)
 
     def player(self, player_id):
@@ -171,11 +179,16 @@ class Match():
         return new_player
     
     def _build_player_frame_index(self):
-        """Index every player's frames by frame number (built once, on demand)."""
+        """Index every player's frames by frame number (built once, on demand).
+
+        Frame numbers are cast to int: the raw importer stores them as ints
+        but the Metrica importer keeps the CSV strings, and a str-keyed index
+        never matches the int lookups in ``frame()``.
+        """
         index = {}
         for player in self.players:
             for fr in player.frames:
-                index.setdefault(fr.frame, []).append((player, fr))
+                index.setdefault(int(fr.frame), []).append((player, fr))
         self._players_by_frame = index
 
     def frame(self, frame_number):
