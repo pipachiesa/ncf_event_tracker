@@ -3,7 +3,13 @@ from lib.player import Player
 from lib.ball import Ball
 from lib.event_generator import EventGenerator, POSSESSION_RADIUS_M
 import csv
+import json
+import os
 from collections import Counter
+
+# Frame rate assumed for raw tracking CSVs written without a .meta.json sidecar
+# (every CSV produced before --frame-stride existed).
+DEFAULT_RAW_FPS = 24
 
 class Match():
     def __init__(self):
@@ -14,6 +20,7 @@ class Match():
         self.source = None
         self.file_path = None
         self.file_name = None
+        self.fps = DEFAULT_RAW_FPS
         # Lazily-built {frame_number: [(player, frame_obj), ...]} index so
         # ``frame()`` only touches players present in that frame instead of
         # scanning all (often thousands of) tracked objects every call.
@@ -79,6 +86,24 @@ class Match():
         self.file_name = file_name
         path = file_path + file_name
         self.source = "raw"
+
+        # Frame numbers in the CSV are always consecutive, but with a tracking
+        # ``--frame-stride`` they tick at fps/stride rather than the video's fps.
+        # main.py records the real rate in a sidecar; without it every timestamp
+        # would be wrong by exactly the stride factor.
+        self.fps = DEFAULT_RAW_FPS
+        meta_path = os.path.join(file_path, file_name.rsplit(".", 1)[0] + ".meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path) as handle:
+                    meta = json.load(handle)
+                self.fps = float(meta.get("effective_fps") or DEFAULT_RAW_FPS)
+                if self.fps != DEFAULT_RAW_FPS:
+                    print(f"fps efectivo desde el sidecar: {self.fps:g} "
+                          f"(frame-stride {meta.get('frame_stride', 1)}).")
+            except Exception as exc:
+                print(f"No pude leer {meta_path} ({exc}); asumo {DEFAULT_RAW_FPS} fps.")
+
         frames = []
         with open(path, "r") as file:
             for line in file:
@@ -96,7 +121,7 @@ class Match():
 
             frame_data = {
                 "frame" : frame_number,
-                "time" : frame_number / 24
+                "time" : frame_number / self.fps
             }
 
             if frame[8] == "0" or frame[9] == "0":

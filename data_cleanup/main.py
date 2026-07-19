@@ -36,6 +36,7 @@ Ball detection notes:
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -474,7 +475,7 @@ def track(video_path, output_dir,
           min_track_frames=DEFAULT_MIN_TRACK_FRAMES, imgsz=DEFAULT_IMGSZ,
           pitch_model_path=DEFAULT_PITCH_MODEL, pitch_conf=DEFAULT_PITCH_CONF,
           homography_every=DEFAULT_HOMOGRAPHY_EVERY, pitch_imgsz=DEFAULT_PITCH_IMGSZ,
-          track_teams=True, generate_video=False, stride=30):
+          track_teams=True, generate_video=False, stride=30, frame_stride=1):
     import supervision as sv
     from ultralytics import YOLO
 
@@ -530,9 +531,38 @@ def track(video_path, output_dir,
     frame_w, frame_h = video_info.width, video_info.height
     fps = int(round(video_info.fps)) or 24
 
+    # ``frame_stride`` runs detection on every Nth video frame: N=2 halves the
+    # GPU cost. The written frame numbers stay CONSECUTIVE (1..M over processed
+    # frames) because lib/ball.py indexes ``frames[frame_number - 1]`` and
+    # event_generator walks ``range(1, match.frames + 1)`` -- gaps would break
+    # both. The real timeline is preserved via the sidecar ``effective_fps``.
+    frame_stride = max(1, int(frame_stride))
+    effective_fps = fps / frame_stride
+
+    # Every frame-count parameter below is expressed in *processed* frames, so
+    # dividing by the stride keeps its meaning in SECONDS unchanged.
+    if frame_stride > 1:
+        track_buffer = max(1, round(track_buffer / frame_stride))
+        min_track_frames = max(1, round(min_track_frames / frame_stride))
+        ball_interp_gap = max(1, round(ball_interp_gap / frame_stride))
+        # ``homography_every`` is deliberately NOT rescaled: it stays in
+        # processed frames, so the pitch model runs ``frame_stride`` times less
+        # often in wall-clock terms. On a fixed/tactical camera the homography
+        # barely moves, so that costs nothing and pays for the second detection
+        # pass. Lower it manually if the camera pans a lot.
+        print(f"frame-stride {frame_stride}: procesando 1 de cada {frame_stride} frames "
+              f"({fps} fps -> {effective_fps:g} fps efectivos).")
+        print(f"  reescalados (conservan su valor en segundos): "
+              f"track-buffer={track_buffer}, min-track-frames={min_track_frames}, "
+              f"ball-interp-gap={ball_interp_gap}")
+        print(f"  homography-every={homography_every} sin reescalar "
+              f"(refresca cada {homography_every * frame_stride} frames de video; "
+              f"OK con camara fija)")
+
     # Longer lost-track buffer => fewer fragmented ids across occlusions.
     try:
-        tracker = sv.ByteTrack(lost_track_buffer=track_buffer, frame_rate=fps)
+        tracker = sv.ByteTrack(lost_track_buffer=track_buffer,
+                               frame_rate=max(1, int(round(effective_fps))))
     except TypeError:  # older supervision signature without these kwargs
         tracker = sv.ByteTrack()
     tracker.reset()
@@ -564,7 +594,12 @@ def track(video_path, output_dir,
         sink.__enter__()
 
     shared_conf = min(DEFAULT_PLAYER_CONF, ball_conf)
-    for frame in tqdm(frame_generator, desc="Collecting Tracking Data..."):
+    for source_index, frame in enumerate(tqdm(frame_generator, desc="Collecting Tracking Data...")):
+        # Skip the frames the stride drops *before* any inference -- decoding is
+        # cheap, the two YOLO passes are what costs.
+        if source_index % frame_stride:
+            continue
+
         if share_model:
             # One pass at the lower confidence; players are re-thresholded in
             # get_detections so their behaviour is unchanged.
@@ -641,6 +676,20 @@ def track(video_path, output_dir,
 
     output_path = os.path.join(output_dir, video_name + ".csv")
     save_tracking_results(players, ball, frame_number, output_path)
+
+    # Sidecar so downstream tools recover the real timeline: with a stride the
+    # CSV's consecutive frame numbers tick at ``effective_fps``, not the video's
+    # fps, and every timestamp would be off by the stride factor without this.
+    meta_path = os.path.join(output_dir, video_name + ".meta.json")
+    with open(meta_path, "w") as meta_file:
+        json.dump({
+            "video": os.path.basename(video_path),
+            "source_fps": fps,
+            "frame_stride": frame_stride,
+            "effective_fps": effective_fps,
+            "tracked_frames": frame_number - 1,
+        }, meta_file, indent=2)
+    print(f"Metadata: {meta_path} (effective_fps={effective_fps:g})")
     return output_path
 
 
@@ -684,6 +733,11 @@ def parse_args():
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
+    parser.add_argument("--frame-stride", type=int, default=1,
+                        help="Run detection on every Nth video frame (2 = half the GPU cost). "
+                             "Frame-count options are rescaled automatically so their meaning "
+                             "in seconds is unchanged; the true timeline is recorded in the "
+                             "sidecar .meta.json. Higher values fragment tracks more.")
     return parser.parse_args()
 
 
@@ -706,6 +760,7 @@ def main():
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
+        frame_stride=args.frame_stride,
     )
     print(f"Tracking data written to: {out}")
 
