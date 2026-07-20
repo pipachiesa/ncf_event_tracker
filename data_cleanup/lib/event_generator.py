@@ -131,6 +131,17 @@ class EventGenerator():
         """Continuous ball-less frames needed to call the ball out of play."""
         return max(1, int(round(self.long_blank_seconds * self.match_fps())))
 
+    # Every ``*_FRAMES`` constant in this module was tuned against 24 fps
+    # tracking. Read literally at another rate they silently change meaning in
+    # SECONDS -- at 15 fps (stride 2 on 30 fps footage) they become ~1.6x
+    # stricter, which is what halved passes and duels. Scale them instead.
+    TUNED_FPS = 24
+
+    def _frames(self, frames_at_tuned_fps):
+        """Convert a threshold tuned at 24 fps into this match's frame count."""
+        return max(1, int(round(frames_at_tuned_fps
+                                * self.match_fps() / self.TUNED_FPS)))
+
     # ------------------------------------------------------------------ #
     # Public entry point                                                 #
     # ------------------------------------------------------------------ #
@@ -227,7 +238,7 @@ class EventGenerator():
                 curr = possessions[i]
                 nxt = possessions[i + 1]
                 is_failed_tackle = (
-                    curr.duration <= FAILED_TACKLE_MAX_FRAMES
+                    curr.duration <= self._frames(FAILED_TACKLE_MAX_FRAMES)
                     and prev.same_team(nxt)
                     and not curr.same_team(prev)
                 )
@@ -246,7 +257,7 @@ class EventGenerator():
         for poss in possessions[1:]:
             last = merged[-1]
             gap = poss.start_frame - last.end_frame
-            if last.same_player(poss) and gap <= SAME_PLAYER_MERGE_GAP:
+            if last.same_player(poss) and gap <= self._frames(SAME_PLAYER_MERGE_GAP):
                 last.end_frame = poss.end_frame
                 last.end_time = poss.end_time
                 last.end_loc = poss.end_loc
@@ -260,7 +271,8 @@ class EventGenerator():
         for poss in possessions:
             # A one-touch pass is legitimately short, so only drop a short
             # possession when it is not a clean hand-off between two others.
-            if poss.duration < MIN_POSSESSION_FRAMES and poss.touches < MIN_POSSESSION_FRAMES:
+            min_poss = self._frames(MIN_POSSESSION_FRAMES)
+            if poss.duration < min_poss and poss.touches < min_poss:
                 continue
             kept.append(poss)
         return kept
@@ -352,7 +364,7 @@ class EventGenerator():
             elif flight["shot"]:
                 # Goalward, gathered by the opposition keeper -> saved shot.
                 self._emit_shot(curr, nxt, flight, log, is_goal=False, saved=True)
-            elif nxt.duration >= TURNOVER_MIN_HOLD_FRAMES:
+            elif nxt.duration >= self._frames(TURNOVER_MIN_HOLD_FRAMES):
                 self._emit_turnover(curr, nxt, flight, log)
             # else: fleeting opposition touch -- not enough evidence of a
             # real turnover, so no event is emitted.
@@ -454,7 +466,17 @@ class EventGenerator():
         }
 
     def match_fps(self):
-        return 25 if self.source == "metrica" else 24
+        """Frames per second of the tracking actually being read.
+
+        Never hardcode this: with ``--frame-stride`` the raw CSV ticks at
+        fps/stride (e.g. 15 instead of 30), and since every threshold below is
+        expressed in FRAMES, a wrong value silently rescales all of them in
+        real time -- which suppressed passes and duels on the first strided run.
+        ``Match`` resolves the true rate from the .meta.json sidecar.
+        """
+        if self.source == "metrica":
+            return 25
+        return getattr(self.match, "fps", None) or 24
 
     def _is_goalward(self, start_loc, end_loc, goal_x):
         if start_loc is None or end_loc is None:
@@ -476,7 +498,7 @@ class EventGenerator():
 
     def _is_aerial_challenge(self, curr, nxt, flight):
         """Best-effort aerial-duel detection (limited by 2D tracking)."""
-        if flight["flight_frames"] < AERIAL_MIN_FLIGHT_FRAMES:
+        if flight["flight_frames"] < self._frames(AERIAL_MIN_FLIGHT_FRAMES):
             return False
         # The two players must have been close together when the ball dropped.
         moment = self.match.frame(nxt.start_frame)
@@ -534,7 +556,7 @@ class EventGenerator():
 
     def _emit_turnover(self, curr, nxt, flight, log):
         """Ball lost to the opposition without leaving the field of play."""
-        intercepted = flight["flight_frames"] >= INTERCEPTION_MIN_FLIGHT_FRAMES
+        intercepted = flight["flight_frames"] >= self._frames(INTERCEPTION_MIN_FLIGHT_FRAMES)
         log.add(Event({
             "team": curr.team,
             "type": "BALL LOST",
