@@ -7,12 +7,20 @@ en una fila de features. La transicion es la unidad de muestra: es exactamente
 donde las reglas deciden PASS / BALL LOST / SHOT / etc., asi que el modelo
 aprende sobre los mismos candidatos que hoy clasifican las reglas.
 
-Uso (por partido):
+Uso (convencion por partido, resuelve las rutas solo):
+    python3 events_model/features.py --match psg_bayern
+
+Uso (rutas explicitas):
     python3 events_model/features.py \
-        --tracking "~/Downloads/psg_bayern_720p (2) (2).csv" \
+        --tracking ~/football_data/matches/psg_bayern/tracking.csv \
         --match-id psg_bayern \
-        --labels output/psg_bayern_720p_events_groundtruth.csv \
+        --labels events_model/dataset/psg_bayern_labeled.csv \
         --out events_model/dataset/psg_bayern_features.csv
+
+Nota: build_dataset.py ya llama a extract() internamente para cada --match,
+asi que normalmente no hace falta correr este script a mano; sirve para
+inspeccionar las features de un partido suelto o generarlas sin labels
+(inferencia).
 
 --labels es opcional: sin labels genera solo las features (para inferencia).
 Con labels (el ground truth del label_tool) agrega la columna `label`.
@@ -30,6 +38,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "data_cleanup"))
 
+import matchpaths                    # noqa: E402
 from lib.match import Match          # noqa: E402
 from lib.event_generator import EventGenerator  # noqa: E402
 from lib import pitch                # noqa: E402
@@ -242,17 +251,31 @@ def extract(tracking_csv, match_id, labels_csv=None):
 
 def main():
     ap = argparse.ArgumentParser(description="Features de tracking por transicion")
-    ap.add_argument("--tracking", required=True, help="CSV crudo de tracking")
-    ap.add_argument("--match-id", required=True,
-                    help="identificador del partido (el split es por partido)")
+    ap.add_argument("--match", default=None,
+                    help="nombre del partido (convencion "
+                         "~/football_data/matches/<match>/ + events_model/dataset/)")
+    ap.add_argument("--tracking", default=None, help="CSV crudo de tracking (override de --match)")
+    ap.add_argument("--match-id", default=None,
+                    help="identificador del partido en la tabla de features "
+                         "(override de --match; el split de build_dataset es por este id)")
     ap.add_argument("--labels", default=None,
-                    help="CSV ground truth del label_tool (opcional)")
-    ap.add_argument("--out", required=True)
+                    help="CSV ground truth del label_tool (opcional; override de --match)")
+    ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    rows = extract(args.tracking, args.match_id, args.labels)
+    if not args.match and not (args.tracking and args.match_id and args.out):
+        ap.error("pasa --match <partido> o --tracking, --match-id y --out")
 
-    out = os.path.expanduser(args.out)
+    match_id = args.match_id or args.match
+    tracking = args.tracking or matchpaths.tracking_path(args.match)
+    labels = args.labels or (matchpaths.labeled_path(args.match) if args.match else None)
+    if labels and not os.path.exists(os.path.expanduser(labels)):
+        labels = None
+    out = args.out or matchpaths.features_path(args.match)
+
+    rows = extract(tracking, match_id, labels)
+
+    out = os.path.expanduser(out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", newline="\n") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
@@ -262,7 +285,7 @@ def main():
     labelled = sum(1 for r in rows if r["label"] not in ("", "NONE"))
     print(f"{len(rows)} transiciones -> {out}"
           + (f" ({labelled} con evento, {len(rows) - labelled} NONE)"
-             if args.labels else " (sin labels)"))
+             if labels else " (sin labels)"))
 
 
 if __name__ == "__main__":

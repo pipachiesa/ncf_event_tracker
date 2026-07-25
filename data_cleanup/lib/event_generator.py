@@ -110,6 +110,42 @@ TURNOVER_MIN_HOLD_FRAMES = 6
 # an interception.
 INTERCEPTION_MIN_FLIGHT_FRAMES = 4
 
+# --- FIFA-style possession physics (Vidal-Codina et al., arXiv 2202.00804) ---
+#
+# A possession GAIN is only real if the player actually touched the ball, and
+# a touch changes the ball's physics: direction or speed. A short "possession"
+# during which the ball sails through the player's radius unaltered is the
+# possession-flicker artifact that inflated BALL LOST to ~800/match. Measured
+# rationale: three data-side fixes (ReID, ball cleanup, blank threshold) all
+# failed to move event counts -- the flicker is structural to proximity-only
+# possession, so the fix must be physical.
+GAIN_CHECK_MAX_S = 1.0        # only vet possessions shorter than this
+GAIN_DIR_MAX_COS = 0.85       # cos(in,out) >= this => direction unchanged (~32deg)
+GAIN_MIN_SPEED_DELTA_MS = 1.5 # m/s in-vs-out difference that indicates a touch
+GAIN_PHYS_WINDOW_S = 0.25     # seconds around the interval to measure in/out
+
+# FIFA loss rule (b2): if the same player regains the ball before ANY other
+# player takes control, no loss happened -- regardless of how long the ball
+# was loose (a dribble that pushes the ball ahead). Bounded by this horizon
+# and vetoed if the ball went dead in between.
+REGAIN_MAX_GAP_S = 4.0
+
+# --- IFAB set piece formation triggers (FIFA paper section 2.3.4) ----------
+#
+# A real restart produces a distinctive PLAYER CONFIGURATION (corner: someone
+# at the corner mark; kick-off: everyone in their own half; throw-in: someone
+# beyond the touchline; goal kick: someone inside their goal area). A tracking
+# blank does NOT. So a long ball blank only becomes a SET PIECE if a formation
+# confirms it; otherwise it is treated as a detection failure and suppressed.
+TRIG_CENTRE_R = 0.06          # kick-off: player within this of the centre mark
+TRIG_OWNHALF_TOL = 0.05       # kick-off: own-half tolerance (norm. length)
+TRIG_MAX_OFFENDERS = 2        # kick-off: players allowed off-side of halfway
+TRIG_CORNER_R = 0.035         # corner: player within this of a corner mark
+TRIG_TOUCHLINE = 0.012        # throw-in: player at/beyond the touchline
+TRIG_GOAL_AREA_HW = 0.15      # goal kick: goal-area half-width (normalised)
+TRIG_LOOKBACK_S = 1.0         # dead-ball tail examined before the restart
+PATTERN_TOL = 0.10            # executor start_loc must be near the trigger zone
+
 
 class EventGenerator():
     def __init__(self, match, possession_radius=POSSESSION_RADIUS_M,
@@ -126,6 +162,10 @@ class EventGenerator():
         self.possessions = []
         # attacking goal x (0 or 1) per normalised team key
         self.attack_goal = {}
+        # {frame: (x, y) normalised} for frames where the ball was seen.
+        # Filled by detect_possessions; used by the gain physics, the regain
+        # rule and the dead-gap checks without re-walking Match frames.
+        self._ball_pos = {}
 
     def long_blank_frames(self):
         """Continuous ball-less frames needed to call the ball out of play."""
@@ -189,6 +229,8 @@ class EventGenerator():
                 continue
             time = moment.time
             ball_norm = self._norm_ball(moment)
+            if ball_norm is not None:
+                self._ball_pos[frame_number] = ball_norm
 
             holder = None
             holder_loc = None
@@ -220,12 +262,98 @@ class EventGenerator():
     # Step 1b: possession noise filtering                                #
     # ------------------------------------------------------------------ #
     def filter_possessions(self, possessions):
+        # Physics first: discard "possessions" where the ball sailed through a
+        # player's radius without changing direction or speed (nobody touched
+        # it). Removing them exposes A-[fake B]-A adjacencies that the merges
+        # below then collapse -- this is what kills possession flicker.
+        possessions = self._validate_gains(possessions)
         possessions = self._remove_failed_tackles(possessions)
         possessions = self._merge_same_player(possessions)
         possessions = self._drop_short_possessions(possessions)
         # Merging / dropping can expose new adjacencies, so settle once more.
         possessions = self._merge_same_player(possessions)
         return possessions
+
+    # ------------------------------------------------------------------ #
+    # FIFA-style gain physics (anti-flicker)                              #
+    # ------------------------------------------------------------------ #
+    def _ball_segment(self, f_from, f_to):
+        """Ball displacement between the nearest detections inside a window.
+
+        Returns ``(dx_m, dy_m, dt_s)`` in metres/seconds, or None when fewer
+        than two detections exist in the window (blank ball -- unmeasurable).
+        """
+        first = last = None
+        for f in range(f_from, f_to + 1):
+            p = self._ball_pos.get(f)
+            if p is not None:
+                first = (f, p)
+                break
+        for f in range(f_to, f_from - 1, -1):
+            p = self._ball_pos.get(f)
+            if p is not None:
+                last = (f, p)
+                break
+        if first is None or last is None or last[0] <= first[0]:
+            return None
+        dx = (last[1][0] - first[1][0]) * pitch.PITCH_LENGTH_M
+        dy = (last[1][1] - first[1][1]) * pitch.PITCH_WIDTH_M
+        dt = (last[0] - first[0]) / self.match_fps()
+        return dx, dy, dt
+
+    def _gain_is_real(self, poss):
+        """FIFA rule: a touch changes the ball's direction or speed.
+
+        Compares the ball's trajectory just before the possession starts with
+        just after it ends. Unmeasurable (ball blanks) => keep the possession:
+        we only discard when the physics POSITIVELY shows nobody touched it.
+        """
+        w = max(2, int(round(GAIN_PHYS_WINDOW_S * self.match_fps())))
+        seg_in = self._ball_segment(poss.start_frame - w, poss.start_frame)
+        seg_out = self._ball_segment(poss.end_frame, poss.end_frame + w)
+        if seg_in is None or seg_out is None:
+            return True
+
+        len_in = (seg_in[0] ** 2 + seg_in[1] ** 2) ** 0.5
+        len_out = (seg_out[0] ** 2 + seg_out[1] ** 2) ** 0.5
+        v_in = len_in / seg_in[2]
+        v_out = len_out / seg_out[2]
+        speed_changed = abs(v_out - v_in) >= GAIN_MIN_SPEED_DELTA_MS
+
+        # A near-static segment has no meaningful direction; judge by speed
+        # alone (ball stopped dead or kicked from rest are both real touches).
+        if len_in < 0.3 or len_out < 0.3:
+            return speed_changed
+
+        cos = (seg_in[0] * seg_out[0] + seg_in[1] * seg_out[1]) / (len_in * len_out)
+        direction_changed = cos < GAIN_DIR_MAX_COS
+        return direction_changed or speed_changed
+
+    def _validate_gains(self, possessions):
+        """Drop short possessions whose ball physics show no actual touch."""
+        max_check = int(round(GAIN_CHECK_MAX_S * self.match_fps()))
+        kept = []
+        for poss in possessions:
+            # Long possessions are self-evidently real (dribbles constantly
+            # alter the ball); only brief ones can be flicker.
+            if poss.duration >= max_check or self._gain_is_real(poss):
+                kept.append(poss)
+        return kept
+
+    def _gap_went_dead(self, f_from, f_to):
+        """True when the ball went out of play between two frames."""
+        blank_run = 0
+        for f in range(f_from, f_to + 1):
+            p = self._ball_pos.get(f)
+            if p is None:
+                blank_run += 1
+                if blank_run >= self.long_blank_frames():
+                    return True
+                continue
+            blank_run = 0
+            if pitch.is_out_of_bounds(p, margin=0.0):
+                return True
+        return False
 
     def _remove_failed_tackles(self, possessions):
         """Drop a brief opponent touch wedged between one player's possessions."""
@@ -254,10 +382,24 @@ class EventGenerator():
         if not possessions:
             return possessions
         merged = [possessions[0]]
+        regain_max = int(round(REGAIN_MAX_GAP_S * self.match_fps()))
         for poss in possessions[1:]:
             last = merged[-1]
             gap = poss.start_frame - last.end_frame
-            if last.same_player(poss) and gap <= self._frames(SAME_PLAYER_MERGE_GAP):
+            mergeable = False
+            if last.same_player(poss):
+                if gap <= self._frames(SAME_PLAYER_MERGE_GAP):
+                    mergeable = True
+                elif gap <= regain_max:
+                    # FIFA loss rule (b2): the same player regaining the ball
+                    # with NO other control frame in between is not a loss --
+                    # e.g. a dribble knocking the ball ahead. Possessions are
+                    # consecutive control intervals, so reaching here already
+                    # means nobody else had the ball; only veto the merge if
+                    # the ball went dead (a set piece separates real events).
+                    mergeable = not self._gap_went_dead(last.end_frame,
+                                                        poss.start_frame)
+            if mergeable:
                 last.end_frame = poss.end_frame
                 last.end_time = poss.end_time
                 last.end_loc = poss.end_loc
@@ -331,7 +473,17 @@ class EventGenerator():
         else:
             flight = self._gap_analysis(prev, curr)
             if flight["out_of_play"]:
-                self._emit_set_piece(curr, log, restart=flight)
+                if flight["out_of_bounds"]:
+                    # The ball was SEEN leaving the pitch: a real restart.
+                    self._emit_set_piece(curr, log, restart=flight)
+                else:
+                    # Only a detection blank. A real restart produces an IFAB
+                    # player formation (corner/kick-off/throw-in/goal-kick);
+                    # a YOLO miss does not. No formation => phantom, suppress.
+                    subtype = self._formation_set_piece(curr)
+                    if subtype is not None:
+                        self._emit_set_piece(curr, log, restart=flight,
+                                             forced_subtype=subtype)
 
         if nxt is None:
             # Nothing follows; we cannot classify the end of this possession.
@@ -346,9 +498,13 @@ class EventGenerator():
         if flight["out_of_play"]:
             if flight["shot"]:
                 self._emit_shot(curr, nxt, flight, log, is_goal=False)
-            else:
-                # Ball was simply played out of bounds.
+            elif flight["out_of_bounds"] or \
+                    self._formation_set_piece(nxt) is not None:
+                # Ball seen out, or the restart formation confirms the
+                # stoppage was real: the ball did leave play.
                 self._emit_ball_out(curr, flight, log)
+            # else: a bare detection blank with no restart formation --
+            # phantom stoppage, no event (mirrors the set piece suppression).
             return
 
         # --- Continuous play -------------------------------------------- #
@@ -456,6 +612,8 @@ class EventGenerator():
         return {
             "flight_frames": flight_frames,
             "out_of_play": out_of_play,
+            "out_of_bounds": out_of_bounds,
+            "long_blank": long_blank,
             "out_norm": out_norm,
             "shot": shot,
             "goal": goal,
@@ -665,8 +823,93 @@ class EventGenerator():
             "end_loc": flight["out_norm"] or curr.end_loc,
         }))
 
-    def _emit_set_piece(self, poss, log, opening=False, restart=None):
-        subtype = self._classify_restart(poss, opening=opening, restart=restart)
+    # ------------------------------------------------------------------ #
+    # IFAB formation triggers (FIFA paper 2.3.4)                          #
+    # ------------------------------------------------------------------ #
+    def _players_normalised(self, frame_number):
+        """[(team, (x, y) normalised)] for every player seen in a frame."""
+        moment = self.match.frame(frame_number)
+        if moment is None:
+            return []
+        out = []
+        for entry in moment.players:
+            frame = entry["frame"]
+            if frame is None or frame.coordinates is None:
+                continue
+            norm = pitch.to_normalised(self.source, frame.x, frame.y)
+            out.append((str(entry["object"].team), norm))
+        return out
+
+    def _formation_set_piece(self, poss):
+        """Detect the restart type from player configurations (IFAB laws).
+
+        Samples the dead-ball tail just before ``poss`` starts and checks, in
+        FIFA's hierarchy order (kick-off > corner > throw-in > goal kick),
+        whether any frame shows the distinctive formation. The trigger is then
+        confirmed by a pattern check: the executor's start location must be
+        consistent with the restart zone. Returns the subtype or None.
+        """
+        lookback = max(2, int(round(TRIG_LOOKBACK_S * self.match_fps())))
+        step = max(1, lookback // 4)
+        sample_frames = list(range(max(1, poss.start_frame - lookback),
+                                   poss.start_frame + 1, step))
+        start = poss.start_loc
+
+        corners = ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0))
+        own_goal = 1.0 - self._attacking_goal(poss.team)
+
+        saw_kickoff = saw_corner = saw_throwin = saw_goalkick = False
+        for fn in sample_frames:
+            players = self._players_normalised(fn)
+            if len(players) < 6:      # too few tracked players to judge
+                continue
+
+            # Kick-off: everyone in their own half (tolerance + a couple of
+            # stragglers for tracking noise), someone at the centre mark.
+            offenders = 0
+            centre_present = False
+            for team, (x, y) in players:
+                goal_x = self._attacking_goal(team)
+                in_own_half = (x <= 0.5 + TRIG_OWNHALF_TOL if goal_x == 1.0
+                               else x >= 0.5 - TRIG_OWNHALF_TOL)
+                if not in_own_half:
+                    offenders += 1
+                if abs(x - 0.5) <= TRIG_CENTRE_R and abs(y - 0.5) <= TRIG_CENTRE_R:
+                    centre_present = True
+            if offenders <= TRIG_MAX_OFFENDERS and centre_present:
+                saw_kickoff = True
+
+            for _team, (x, y) in players:
+                if any(abs(x - cx) <= TRIG_CORNER_R and abs(y - cy) <= TRIG_CORNER_R
+                       for cx, cy in corners):
+                    saw_corner = True
+                if y <= TRIG_TOUCHLINE or y >= 1.0 - TRIG_TOUCHLINE:
+                    saw_throwin = True
+                if pitch.near_goal((x, y), own_goal, depth=pitch.GOAL_AREA_DEPTH,
+                                   half_width=TRIG_GOAL_AREA_HW):
+                    saw_goalkick = True
+
+        # Hierarchy + pattern confirmation (executor near the restart zone).
+        if saw_kickoff and (start is None or pitch.near_centre(start)):
+            return "KICK OFF"
+        if saw_corner and start is not None and \
+                any(abs(start[0] - cx) <= PATTERN_TOL and abs(start[1] - cy) <= PATTERN_TOL
+                    for cx, cy in corners):
+            return "CORNER"
+        if saw_throwin and start is not None and \
+                (start[1] <= PATTERN_TOL or start[1] >= 1.0 - PATTERN_TOL):
+            return "THROW IN"
+        if saw_goalkick and start is not None and \
+                pitch.near_goal(start, own_goal,
+                                depth=pitch.GOAL_AREA_DEPTH + PATTERN_TOL,
+                                half_width=TRIG_GOAL_AREA_HW + PATTERN_TOL):
+            return "GOAL KICK"
+        return None
+
+    def _emit_set_piece(self, poss, log, opening=False, restart=None,
+                        forced_subtype=None):
+        subtype = forced_subtype or \
+            self._classify_restart(poss, opening=opening, restart=restart)
         log.add(Event({
             "team": poss.team,
             "type": "SET PIECE",

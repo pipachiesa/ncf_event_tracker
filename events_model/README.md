@@ -8,31 +8,34 @@ Video (T-DEED pre-entrenado, ver spike) → SHOT, GOAL, FOUL.
 
 ## Flujo de etiquetado (por cada partido)
 
+Convención de rutas (ver `events_model/matchpaths.py`): el raw pesado
+(video + tracking) vive fuera del repo en `~/football_data/matches/<match>/`;
+las labels y features livianas se commitean en `events_model/dataset/` (ver
+`events_model/dataset/README.md` para el detalle de qué se commitea).
+
 ```bash
+# 0. Trackear (Colab) y guardar el resultado en la convención
+mkdir -p ~/football_data/matches/mi_partido
+cp video.mp4    ~/football_data/matches/mi_partido/video.mp4
+cp tracking.csv ~/football_data/matches/mi_partido/tracking.csv
+
 # 1. Generar las propuestas de las reglas (las auditadas de events-audit)
-python3 events_model/propose_events.py \
-    --tracking "~/Downloads/mi_partido.csv" \
-    --out dataset/mi_partido_events.csv
+python3 events_model/propose_events.py --match mi_partido
 
 # 2. Corregirlas contra el video (aceptar/rechazar/reetiquetar/agregar).
 #    Guarda progreso solo (.review.json): se puede cortar y retomar.
-#    Al salir con q exporta dataset/mi_partido_events_groundtruth.csv
-python3 events_model/label_tool.py \
-    --video ~/Desktop/foostats_ai/input_videos/mi_partido.mp4 \
-    --events dataset/mi_partido_events.csv \
-    --tracking "~/Downloads/mi_partido.csv"
+#    Al salir con q exporta events_model/dataset/mi_partido_labeled.csv
+python3 events_model/label_tool.py --match mi_partido
 
-# 3. Features de tracking + labels (una fila por transición de posesión)
-python3 events_model/features.py \
-    --tracking "~/Downloads/mi_partido.csv" \
-    --match-id mi_partido \
-    --labels dataset/mi_partido_events_groundtruth.csv \
-    --out dataset/mi_partido_features.csv
-
-# 4. Con >= 2 partidos etiquetados: dataset con split POR PARTIDO
-python3 events_model/build_dataset.py dataset/*_features.csv \
-    --holdout mi_partido_holdout
+# 3. Con >= 1 partido etiquetado: features + dataset con split POR PARTIDO
+#    (build_dataset.py llama a features.py internamente por cada --match)
+python3 events_model/build_dataset.py \
+    --match mi_partido --match otro_partido \
+    --val otro_partido --test un_tercer_partido
 ```
+
+Rutas explícitas (sin la convención `--match`) siguen funcionando en los
+tres scripts — ver el `--help` de cada uno.
 
 Teclas del label tool: `y` acepta · `x` rechaza · `r`+clase reetiqueta ·
 `a`+clase+equipo agrega (p. ej. FOUL, que las reglas no proponen) · `u` undo ·
@@ -51,5 +54,8 @@ Teclas del label tool: `y` acepta · `x` rechaza · `r`+clase reetiqueta ·
 - [ ] Validación en partido held-out, precision/recall por tipo
 - [ ] Integrar al pipeline (mismo formato CSV que `generate_events`)
 
-Notas: `dataset/` está gitignoreado (datos derivados). Todo esto corre en CPU
-local; lo único que pide GPU (Colab) es la inferencia del spotter T-DEED.
+Notas: `dataset/` SÍ se versiona (labels + features, ver
+`events_model/dataset/README.md`); los intermedios de trabajo (propuestas,
+progreso de review, splits train/val/test) están gitignoreados y se
+regeneran. Todo esto corre en CPU local; lo único que pide GPU (Colab) es la
+inferencia del spotter T-DEED.

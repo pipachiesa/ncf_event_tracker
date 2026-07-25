@@ -6,15 +6,18 @@ tracking superpuestas) y deja aceptar / rechazar / reetiquetar / agregar eventos
 con el teclado. Exporta un ground truth en el mismo formato Metrica del pipeline
 mas columnas de auditoria (Verdict, Original Type).
 
-Uso:
-    python3 events_model/label_tool.py \
-        --video  ~/Desktop/foostats_ai/input_videos/psg_bayern_720p.mp4 \
-        --events output/psg_bayern_720p_events.csv \
-        --tracking "~/Downloads/psg_bayern_720p (2) (2).csv"
+Uso (convencion por partido, resuelve las rutas solo):
+    python3 events_model/label_tool.py --match psg_bayern
 
-El progreso se guarda solo (<events>.review.json) despues de cada decision:
-se puede cortar y retomar cuando sea. Al salir (q) exporta
-<events>_groundtruth.csv.
+Uso (rutas explicitas):
+    python3 events_model/label_tool.py \
+        --video  ~/football_data/matches/psg_bayern/video.mp4 \
+        --events events_model/dataset/psg_bayern_proposed.csv \
+        --tracking ~/football_data/matches/psg_bayern/tracking.csv
+
+El progreso se guarda solo (.review.json) despues de cada decision: se puede
+cortar y retomar cuando sea. Al salir (q) exporta el ground truth a
+<match>_labeled.csv (o <events>_groundtruth.csv en modo de rutas explicitas).
 
 Teclas (pensadas para etiquetar rapido, mano derecha en el teclado):
     ESPACIO     play / pausa
@@ -43,6 +46,8 @@ import os
 import sys
 
 import cv2
+
+import matchpaths
 
 CLASS_KEYS = {
     ord("1"): "PASS",
@@ -119,6 +124,45 @@ def load_tracking(path):
     return by_frame
 
 
+def find_static_ball_frames(by_frame, fps, still_px=2.0, min_still_s=1.5):
+    """Frames donde la 'pelota' esta inmovil = casi seguro una marca de cancha.
+
+    El detector confunde con la pelota a objetos blancos y chicos que no se
+    mueven (el punto de penal es el caso tipico). Una pelota en juego nunca
+    queda clavada al pixel exacto durante segundos.
+
+    NO se borra la deteccion: eliminarlas empeora los eventos (las rachas mas
+    largas resultaron ser la pelota real durante pausas del juego). Solo se
+    marcan para dibujarlas distinto y que no te guien mal al etiquetar.
+    """
+    balls = []
+    for frame in sorted(by_frame):
+        for obj, _oid, _team, (x1, y1, x2, y2) in by_frame[frame]:
+            if obj == "ball":
+                balls.append((frame, (x1 + x2) / 2, (y1 + y2) / 2))
+                break
+
+    suspicious, run = set(), []
+    min_len = max(2, int(min_still_s * fps))
+
+    def flush():
+        if len(run) >= min_len:
+            suspicious.update(f for f, _, _ in run)
+
+    for i, (f, cx, cy) in enumerate(balls):
+        if not run:
+            run.append((f, cx, cy))
+            continue
+        pf, px, py = run[-1]
+        if f - pf <= 2 and abs(cx - px) < still_px and abs(cy - py) < still_px:
+            run.append((f, cx, cy))
+        else:
+            flush()
+            run = [(f, cx, cy)]
+    flush()
+    return suspicious
+
+
 class ReviewState:
     """Decisiones tomadas + eventos agregados; persiste a JSON tras cada cambio."""
 
@@ -165,14 +209,23 @@ class ReviewState:
 
 
 class LabelTool:
-    def __init__(self, video_path, events, tracking, state, fps):
+    def __init__(self, video_path, events, tracking, state, fps, frame_stride=1):
         self.cap = cv2.VideoCapture(video_path)
         if not self.cap.isOpened():
             sys.exit(f"No pude abrir el video: {video_path}")
-        self.fps = fps or self.cap.get(cv2.CAP_PROP_FPS) or 25.0
-        self.total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # ``self.vframe`` cuenta frames del CSV/tracking, NO del video: los
+        # eventos y las cajas estan indexados asi. Con --frame-stride los dos
+        # numeros dejan de coincidir (el frame 1000 del CSV es el 1999 del
+        # video), y usar uno por el otro desincroniza el video respecto de las
+        # cajas -- la pelota aparece en cualquier lado menos donde esta.
+        self.frame_stride = max(1, int(frame_stride))
+        self.fps = fps or ((self.cap.get(cv2.CAP_PROP_FPS) or 25.0)
+                           / self.frame_stride)
+        self.total = (int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                      // self.frame_stride)
         self.events = events
         self.tracking = tracking
+        self.static_ball = find_static_ball_frames(tracking, self.fps)
         self.state = state
         self.idx = self._first_pending()
         self.vframe = 0          # frame de video actual (0-based)
@@ -215,10 +268,22 @@ class LabelTool:
 
     def seek(self, vframe):
         self.vframe = max(0, min(self.total - 1, vframe))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.vframe)
+        # Unico lugar donde se traduce a coordenadas de video.
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.vframe * self.frame_stride)
         ok, frame = self.cap.read()
         if ok:
             self.raw = frame
+
+    def advance(self):
+        """Avanzar UN frame del CSV = ``frame_stride`` frames del video."""
+        self.vframe += 1
+        ok, frame = None, None
+        for _ in range(self.frame_stride):
+            ok, frame = self.cap.read()
+            if not ok:
+                return False
+        self.raw = frame
+        return True
 
     def step(self, delta):
         self.playing = False
@@ -256,7 +321,15 @@ class LabelTool:
                     self.tracking.get(self.vframe + 1, []):
                 if obj == "ball":
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    cv2.circle(frame, (cx, cy), 10, (0, 255, 255), 2)
+                    if (self.vframe + 1) in self.static_ball:
+                        # Inmovil = casi seguro el punto de penal u otra marca
+                        # fija. Se dibuja apagado y con "?" para que no te guie:
+                        # la pelota real esta en otro lado, buscala con el ojo.
+                        cv2.circle(frame, (cx, cy), 10, (120, 120, 120), 1)
+                        cv2.putText(frame, "?", (cx + 12, cy + 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 120), 1)
+                    else:
+                        cv2.circle(frame, (cx, cy), 10, (0, 255, 255), 2)
                     continue
                 color = highlight.get(oid) or TEAM_COLORS.get(team, (200, 200, 200))
                 thick = 2 if oid in highlight else 1
@@ -309,13 +382,8 @@ class LabelTool:
             if self.playing:
                 if self.vframe >= end:
                     self.seek(start)  # loop del clip del evento
-                else:
-                    self.vframe += 1
-                    ok, frame = self.cap.read()
-                    if ok:
-                        self.raw = frame
-                    else:
-                        self.seek(start)
+                elif not self.advance():
+                    self.seek(start)
 
             display = self.draw()
             if display is not None:
@@ -427,31 +495,65 @@ def export_ground_truth(events, state, out_path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--video", required=True)
-    ap.add_argument("--events", required=True,
-                    help="CSV de eventos propuesto por las reglas (formato Metrica)")
+    ap.add_argument("--match", default=None,
+                    help="nombre del partido (convencion "
+                         "~/football_data/matches/<match>/ + events_model/dataset/)")
+    ap.add_argument("--video", default=None, help="override de --match")
+    ap.add_argument("--events", default=None,
+                    help="CSV de eventos propuesto por las reglas (override de --match)")
     ap.add_argument("--tracking", default=None,
-                    help="CSV crudo de tracking para superponer las cajas (opcional)")
+                    help="CSV crudo de tracking para superponer las cajas (override de --match)")
     ap.add_argument("--fps", type=float, default=None,
-                    help="override del fps del video (default: el que reporta cv2)")
+                    help="override del fps EFECTIVO del tracking, o sea "
+                         "fps_video/frame_stride (default: se deduce del video "
+                         "y del sidecar)")
     args = ap.parse_args()
 
-    video = os.path.expanduser(args.video)
-    events_path = os.path.expanduser(args.events)
+    if not args.match and not (args.video and args.events):
+        ap.error("pasa --match <partido> o --video y --events")
+
+    video = os.path.expanduser(args.video or matchpaths.video_path(args.match))
+    events_path = os.path.expanduser(args.events or matchpaths.proposed_path(args.match))
+    tracking_path = args.tracking or (matchpaths.tracking_path(args.match) if args.match else None)
+
+    if args.match:
+        review_path = matchpaths.review_path(args.match)
+        labeled_out = matchpaths.labeled_path(args.match)
+    else:
+        base = events_path.rsplit(".", 1)[0]
+        review_path = base + ".review.json"
+        labeled_out = base + "_groundtruth.csv"
+
     events = load_events(events_path)
     if not events:
         sys.exit("El CSV de eventos esta vacio.")
-    tracking = load_tracking(os.path.expanduser(args.tracking)) if args.tracking else {}
+    tracking = load_tracking(os.path.expanduser(tracking_path)) if tracking_path else {}
 
-    base = events_path.rsplit(".", 1)[0]
-    state = ReviewState(base + ".review.json")
+    os.makedirs(os.path.dirname(review_path) or ".", exist_ok=True)
+    state = ReviewState(review_path)
     if state.decisions:
         print(f"Retomando: {len(state.decisions)} decisiones previas")
 
-    tool = LabelTool(video, events, tracking, state, args.fps)
+    # El stride decide que fotograma del video corresponde a cada frame del
+    # CSV. Sin esto el video y las cajas van desfasados un factor del stride.
+    frame_stride = 1
+    if tracking_path:
+        meta_path = os.path.expanduser(tracking_path).rsplit(".", 1)[0] + ".meta.json"
+        if os.path.exists(meta_path):
+            with open(meta_path) as fh:
+                meta = json.load(fh)
+            frame_stride = int(meta.get("frame_stride") or 1)
+            print(f"Sidecar: frame_stride={frame_stride}, "
+                  f"effective_fps={meta.get('effective_fps')}")
+        else:
+            print(f"AVISO: no encuentro {meta_path}; asumo frame_stride=1. "
+                  f"Si el tracking uso --frame-stride, el video va a ir "
+                  f"desincronizado de las cajas.")
+
+    tool = LabelTool(video, events, tracking, state, args.fps, frame_stride)
     tool.run()
 
-    out = export_ground_truth(events, state, base + "_groundtruth.csv")
+    out = export_ground_truth(events, state, labeled_out)
     total = len(state.decisions)
     print(f"Revisados {total}/{len(events)} + {len(state.added)} agregados")
     print(f"Ground truth -> {out}")

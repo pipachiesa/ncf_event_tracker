@@ -127,6 +127,14 @@ DEFAULT_PITCH_IMGSZ = 1280
 # every missed detection.
 BALL_INTERP_MAX_GAP = 15
 
+# Ball-candidate continuity (see ``_pick_ball``). A powerful shot peaks around
+# 35 m/s; above that no real ball is moving, so a candidate that far from the
+# last known position is a different white object (penalty spot, line, crowd).
+MAX_BALL_SPEED_MS = 40.0
+PITCH_SPAN_M = 105.0        # pitch length the frame width roughly spans
+BALL_JUMP_SLACK_PX = 120.0  # tolerance for jitter / imperfect scale
+DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed in
+
 # ByteTrack keeps a "lost" player track alive for this many frames before
 # dropping it; a longer buffer reuses the same id across occlusions/missed
 # detections instead of minting a fresh id on every reappearance (which
@@ -290,10 +298,53 @@ def resolve_player_class_ids(model):
     return ids or [COCO_PERSON]
 
 
+def _pick_ball(ball_detections, frame_w, frame_h, last_xy, gap_frames,
+               fps=DEFAULT_TRACK_FPS):
+    """Choose one ball box, preferring trajectory continuity over confidence.
+
+    ``last_xy`` is the previous accepted ball centre in pixels (or None) and
+    ``gap_frames`` how many frames ago it was seen. A candidate within the
+    reachable radius keeps its confidence score; one that would require the
+    ball to teleport is penalised hard. With no history we fall back to
+    confidence, which is the old behaviour.
+    """
+    conf = ball_detections.confidence
+    if conf is None:
+        return ball_detections[0:1]
+    if last_xy is None:
+        return ball_detections[int(np.argmax(conf))][None] \
+            if hasattr(ball_detections[0], "__len__") else \
+            ball_detections[int(np.argmax(conf)):int(np.argmax(conf)) + 1]
+
+    # Reachable radius in pixels: MAX_BALL_SPEED_MS over the elapsed gap,
+    # converted with the pitch length spanned by the frame width, plus a
+    # constant slack for jitter. Grows with the gap so a long blank doesn't
+    # lock the ball to a stale position.
+    px_per_m = frame_w / PITCH_SPAN_M
+    radius = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)
+              * px_per_m) + BALL_JUMP_SLACK_PX
+
+    best_i, best_score = 0, -1e9
+    for i, box in enumerate(ball_detections.xyxy):
+        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        dist = ((cx - last_xy[0]) ** 2 + (cy - last_xy[1]) ** 2) ** 0.5
+        score = float(conf[i])
+        if dist > radius:
+            # Physically unreachable: only accept if nothing else is plausible.
+            score -= 10.0 + dist / max(1.0, radius)
+        else:
+            # Reward staying near the predicted position.
+            score += 0.25 * (1.0 - dist / radius)
+        if score > best_score:
+            best_i, best_score = i, score
+    return ball_detections[best_i:best_i + 1]
+
+
 def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL,
                    player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF,
-                   transformer=None):
+                   transformer=None, last_ball_xy=None, frames_since_ball=1,
+                   effective_fps=DEFAULT_TRACK_FPS):
     import supervision as sv
 
     # Players: keep the player/goalkeeper classes (drop ball & referee). When a
@@ -315,12 +366,20 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     # Ball: filter to the model's ball class (0 for football models, 32 for COCO).
     ball_all = sv.Detections.from_ultralytics(ball_result)
     ball_detections = ball_all[ball_all.class_id == ball_class_id]
-    # The ball is unique: at low confidence several boxes can fire, so keep only
-    # the single most confident one (a stray false positive must not replace the
-    # real ball).
-    if len(ball_detections) > 1 and ball_detections.confidence is not None:
-        best = int(np.argmax(ball_detections.confidence))
-        ball_detections = ball_detections[best:best + 1]
+    # The ball is unique, so only one box survives. Picking purely by
+    # confidence is WRONG on a fixed camera: the penalty spot, pitch markings
+    # and crowd objects are small white blobs that regularly out-score the real
+    # ball, and each time they do the stored position teleports. Measured on
+    # spain-france: 25% of consecutive ball movements were physically
+    # impossible (p90 = 417 m/s = 1502 km/h), which is what makes possession
+    # flicker and defeats any physics-based possession logic downstream.
+    # So candidates are scored by CONTINUITY first: a candidate reachable from
+    # the last known position at a plausible speed beats a more confident one
+    # that would require teleporting.
+    if len(ball_detections) > 1:
+        ball_detections = _pick_ball(ball_detections, frame_w, frame_h,
+                                     last_ball_xy, frames_since_ball,
+                                     fps=effective_fps)
 
     # Project to pitch coords. Image-space is always on-pitch but approximate;
     # the homography is accurate but goes wild on bad-keypoint frames. So: keep
@@ -585,6 +644,8 @@ def track(video_path, output_dir,
 
     players, ball = {}, {}
     frame_number = 1
+    # Last accepted ball centre (pixels) + how long ago, for _pick_ball.
+    last_ball_xy, frames_since_ball = None, 1
     transformer = None  # most recent image->pitch homography
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -621,7 +682,9 @@ def track(video_path, output_dir,
         all_detections, ball_detections = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
             ball_class_id=ball_class_id, player_class_ids=player_class_ids,
-            player_conf=DEFAULT_PLAYER_CONF, transformer=transformer)
+            player_conf=DEFAULT_PLAYER_CONF, transformer=transformer,
+            last_ball_xy=last_ball_xy, frames_since_ball=frames_since_ball,
+            effective_fps=effective_fps)
 
         object_ids = all_detections.tracker_id
         team_ids = all_detections.class_id
@@ -640,11 +703,15 @@ def track(video_path, output_dir,
 
         if ball_detections.xyxy.shape[0]:
             b = ball_detections
+            _bb = b.xyxy[0]
+            last_ball_xy = ((_bb[0] + _bb[2]) / 2.0, (_bb[1] + _bb[3]) / 2.0)
+            frames_since_ball = 1
             ball[str(frame_number)] = {
                 "X1": b.xyxy[0][0], "Y1": b.xyxy[0][1], "X2": b.xyxy[0][2], "Y2": b.xyxy[0][3],
                 "X_Pitch": ball_pitch_xys[0][0], "Y_Pitch": ball_pitch_xys[0][1],
             }
         else:
+            frames_since_ball += 1
             ball[str(frame_number)] = {
                 "X1": 0, "Y1": 0, "X2": 0, "Y2": 0, "X_Pitch": 0, "Y_Pitch": 0,
             }
