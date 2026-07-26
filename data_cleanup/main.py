@@ -132,7 +132,15 @@ BALL_INTERP_MAX_GAP = 15
 # last known position is a different white object (penalty spot, line, crowd).
 MAX_BALL_SPEED_MS = 40.0
 PITCH_SPAN_M = 105.0        # pitch length the frame width roughly spans
-BALL_JUMP_SLACK_PX = 120.0  # tolerance for jitter / imperfect scale
+# No extra slack. The first version added 120 px "for jitter", but 120 px is
+# ~6.6 m of pitch, which by itself authorises a ~95 m/s jump -- the gate was
+# licensing exactly what it existed to block (impossible moves only fell
+# 26.3% -> 17.6%). The physics radius already absorbs jitter: at 40 m/s and
+# 14.5 fps a single-frame gap allows ~2.8 m ~ 50 px. Parameter sweep on
+# psg-bayern (impossible% / detections kept): 120 px -> 14.8% / 70%,
+# 20 px -> 7.1% / 60%, 0 px -> 2.0% / 57%. Dropping vmax to 30 only buys
+# 2 more points of impossible% while costing 8 points of coverage.
+BALL_JUMP_SLACK_PX = 0.0
 DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed in
 
 # ByteTrack keeps a "lost" player track alive for this many frames before
