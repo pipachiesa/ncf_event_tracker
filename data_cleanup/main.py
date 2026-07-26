@@ -303,18 +303,21 @@ def _pick_ball(ball_detections, frame_w, frame_h, last_xy, gap_frames,
     """Choose one ball box, preferring trajectory continuity over confidence.
 
     ``last_xy`` is the previous accepted ball centre in pixels (or None) and
-    ``gap_frames`` how many frames ago it was seen. A candidate within the
-    reachable radius keeps its confidence score; one that would require the
-    ball to teleport is penalised hard. With no history we fall back to
-    confidence, which is the old behaviour.
+    ``gap_frames`` how many frames ago it was seen. Candidates that would
+    require the ball to teleport are discarded outright; confidence only picks
+    among the physically reachable ones. Returns an EMPTY detection set when
+    none are reachable. With no history we fall back to confidence.
+
+    Always index with a SLICE (``[i:i+1]``): ``supervision`` validates that
+    ``xyxy`` stays a 2-D (N, 4) array, and scalar/None indexing produces a
+    (1, 1, 4) array that raises deep inside ``Detections.__post_init__``.
     """
     conf = ball_detections.confidence
     if conf is None:
         return ball_detections[0:1]
     if last_xy is None:
-        return ball_detections[int(np.argmax(conf))][None] \
-            if hasattr(ball_detections[0], "__len__") else \
-            ball_detections[int(np.argmax(conf)):int(np.argmax(conf)) + 1]
+        best = int(np.argmax(conf))
+        return ball_detections[best:best + 1]
 
     # Reachable radius in pixels: MAX_BALL_SPEED_MS over the elapsed gap,
     # converted with the pitch length spanned by the frame width, plus a
