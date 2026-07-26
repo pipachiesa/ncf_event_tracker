@@ -324,19 +324,26 @@ def _pick_ball(ball_detections, frame_w, frame_h, last_xy, gap_frames,
     radius = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)
               * px_per_m) + BALL_JUMP_SLACK_PX
 
-    best_i, best_score = 0, -1e9
+    # Reachability is a HARD filter, never a score term: a 0.80-confidence
+    # marker must not outscore a 0.35-confidence real ball just by being more
+    # confident. Physics first, confidence only to break ties among the
+    # candidates that are physically possible.
+    reachable = []
     for i, box in enumerate(ball_detections.xyxy):
         cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
         dist = ((cx - last_xy[0]) ** 2 + (cy - last_xy[1]) ** 2) ** 0.5
-        score = float(conf[i])
-        if dist > radius:
-            # Physically unreachable: only accept if nothing else is plausible.
-            score -= 10.0 + dist / max(1.0, radius)
-        else:
-            # Reward staying near the predicted position.
-            score += 0.25 * (1.0 - dist / radius)
-        if score > best_score:
-            best_i, best_score = i, score
+        if dist <= radius:
+            reachable.append((float(conf[i]), -dist, i))
+
+    if not reachable:
+        # Every candidate would require the ball to teleport. Recording one
+        # anyway is what corrupted the trajectory, so emit nothing and let
+        # interpolate_ball bridge the gap. ``radius`` grows with ``gap_frames``,
+        # so a genuinely lost ball is re-acquired in about a second rather than
+        # being suppressed for good.
+        return ball_detections[0:0]
+
+    best_i = max(reachable)[2]
     return ball_detections[best_i:best_i + 1]
 
 
@@ -376,7 +383,13 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     # So candidates are scored by CONTINUITY first: a candidate reachable from
     # the last known position at a plausible speed beats a more confident one
     # that would require teleporting.
-    if len(ball_detections) > 1:
+    # The gate runs even with a SINGLE candidate: the common failure is not
+    # choosing badly among several boxes, it is the real ball going undetected
+    # in a frame while a marker fires alone -- accepting it unconditionally is
+    # exactly what teleports the trajectory. An unreachable lone detection is
+    # dropped (the frame stays blank and interpolate_ball bridges it), which is
+    # strictly better than recording a position the ball cannot be at.
+    if len(ball_detections):
         ball_detections = _pick_ball(ball_detections, frame_w, frame_h,
                                      last_ball_xy, frames_since_ball,
                                      fps=effective_fps)
