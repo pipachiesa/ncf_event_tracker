@@ -131,16 +131,14 @@ BALL_INTERP_MAX_GAP = 15
 # 35 m/s; above that no real ball is moving, so a candidate that far from the
 # last known position is a different white object (penalty spot, line, crowd).
 MAX_BALL_SPEED_MS = 40.0
-PITCH_SPAN_M = 105.0        # pitch length the frame width roughly spans
-# No extra slack. The first version added 120 px "for jitter", but 120 px is
-# ~6.6 m of pitch, which by itself authorises a ~95 m/s jump -- the gate was
-# licensing exactly what it existed to block (impossible moves only fell
-# 26.3% -> 17.6%). The physics radius already absorbs jitter: at 40 m/s and
-# 14.5 fps a single-frame gap allows ~2.8 m ~ 50 px. Parameter sweep on
-# psg-bayern (impossible% / detections kept): 120 px -> 14.8% / 70%,
-# 20 px -> 7.1% / 60%, 0 px -> 2.0% / 57%. Dropping vmax to 30 only buys
-# 2 more points of impossible% while costing 8 points of coverage.
-BALL_JUMP_SLACK_PX = 0.0
+# The gate compares distances in PITCH METRES (see _pick_ball), so no pixel
+# scale and no slack term are involved. Two earlier attempts failed here:
+# a 120 px "jitter slack" was ~6.6 m of pitch and by itself licensed ~95 m/s
+# jumps (impossible moves only fell 26.3% -> 17.6%), and gating in pixel space
+# stalled at 12.1% because perspective makes a pixel worth far more metres at
+# the far touchline. Sweep on psg-bayern in pitch space: 40 m/s keeps ~57% of
+# detections at ~2% impossible; 30 m/s reaches 0% but costs 8 more points of
+# coverage, which is not worth it (interpolate_ball bridges short gaps anyway).
 DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed in
 
 # ByteTrack keeps a "lost" player track alive for this many frames before
@@ -306,62 +304,58 @@ def resolve_player_class_ids(model):
     return ids or [COCO_PERSON]
 
 
-def _pick_ball(ball_detections, frame_w, frame_h, last_xy, gap_frames,
+def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
                fps=DEFAULT_TRACK_FPS):
-    """Choose one ball box, preferring trajectory continuity over confidence.
+    """Choose one ball detection, preferring trajectory continuity.
 
-    ``last_xy`` is the previous accepted ball centre in pixels (or None) and
-    ``gap_frames`` how many frames ago it was seen. Candidates that would
-    require the ball to teleport are discarded outright; confidence only picks
-    among the physically reachable ones. Returns an EMPTY detection set when
-    none are reachable. With no history we fall back to confidence.
+    Works in PITCH COORDINATES (centimetres), never pixels. An earlier version
+    gated in pixel space and only cut impossible moves 24.5% -> 12.1%, because
+    the homography is perspective: the same pixel distance is a few metres near
+    the camera and many metres at the far touchline, so a pixel radius is far
+    too permissive exactly where play is furthest away. Distances are compared
+    in metres, which is also the unit the "impossible move" metric uses.
 
-    Always index with a SLICE (``[i:i+1]``): ``supervision`` validates that
-    ``xyxy`` stays a 2-D (N, 4) array, and scalar/None indexing produces a
-    (1, 1, 4) array that raises deep inside ``Detections.__post_init__``.
+    ``last_pitch`` is the previously accepted ball position (cm) or None, and
+    ``gap_frames`` how many frames ago it was seen. Reachability is a HARD
+    filter -- confidence only breaks ties among physically possible candidates,
+    so a high-confidence pitch marking cannot outvote a faint real ball.
+    Returns empty selections when nothing is reachable: leaving the frame blank
+    (interpolate_ball bridges it) beats recording an impossible position.
+
+    Always index Detections with a SLICE (``[i:i+1]``): supervision validates
+    that ``xyxy`` stays 2-D (N, 4) and scalar indexing raises deep inside
+    ``Detections.__post_init__``.
     """
     conf = ball_detections.confidence
+    if len(ball_detections) == 0:
+        return ball_detections, ball_pitch
     if conf is None:
-        return ball_detections[0:1]
-    if last_xy is None:
+        return ball_detections[0:1], ball_pitch[0:1]
+    if last_pitch is None:
         best = int(np.argmax(conf))
-        return ball_detections[best:best + 1]
+        return ball_detections[best:best + 1], ball_pitch[best:best + 1]
 
-    # Reachable radius in pixels: MAX_BALL_SPEED_MS over the elapsed gap,
-    # converted with the pitch length spanned by the frame width, plus a
-    # constant slack for jitter. Grows with the gap so a long blank doesn't
-    # lock the ball to a stale position.
-    px_per_m = frame_w / PITCH_SPAN_M
-    radius = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)
-              * px_per_m) + BALL_JUMP_SLACK_PX
+    # Reachable radius in centimetres, growing with the blank gap so a
+    # genuinely lost ball is re-acquired instead of suppressed forever.
+    radius_cm = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)) * 100.0
 
-    # Reachability is a HARD filter, never a score term: a 0.80-confidence
-    # marker must not outscore a 0.35-confidence real ball just by being more
-    # confident. Physics first, confidence only to break ties among the
-    # candidates that are physically possible.
     reachable = []
-    for i, box in enumerate(ball_detections.xyxy):
-        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
-        dist = ((cx - last_xy[0]) ** 2 + (cy - last_xy[1]) ** 2) ** 0.5
-        if dist <= radius:
+    for i, (x, y) in enumerate(ball_pitch):
+        dist = ((x - last_pitch[0]) ** 2 + (y - last_pitch[1]) ** 2) ** 0.5
+        if dist <= radius_cm:
             reachable.append((float(conf[i]), -dist, i))
 
     if not reachable:
-        # Every candidate would require the ball to teleport. Recording one
-        # anyway is what corrupted the trajectory, so emit nothing and let
-        # interpolate_ball bridge the gap. ``radius`` grows with ``gap_frames``,
-        # so a genuinely lost ball is re-acquired in about a second rather than
-        # being suppressed for good.
-        return ball_detections[0:0]
+        return ball_detections[0:0], ball_pitch[0:0]
 
-    best_i = max(reachable)[2]
-    return ball_detections[best_i:best_i + 1]
+    best = max(reachable)[2]
+    return ball_detections[best:best + 1], ball_pitch[best:best + 1]
 
 
 def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL,
                    player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF,
-                   transformer=None, last_ball_xy=None, frames_since_ball=1,
+                   transformer=None, last_ball_pitch=None, frames_since_ball=1,
                    effective_fps=DEFAULT_TRACK_FPS):
     import supervision as sv
 
@@ -394,16 +388,6 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     # So candidates are scored by CONTINUITY first: a candidate reachable from
     # the last known position at a plausible speed beats a more confident one
     # that would require teleporting.
-    # The gate runs even with a SINGLE candidate: the common failure is not
-    # choosing badly among several boxes, it is the real ball going undetected
-    # in a frame while a marker fires alone -- accepting it unconditionally is
-    # exactly what teleports the trajectory. An unreachable lone detection is
-    # dropped (the frame stays blank and interpolate_ball bridges it), which is
-    # strictly better than recording a position the ball cannot be at.
-    if len(ball_detections):
-        ball_detections = _pick_ball(ball_detections, frame_w, frame_h,
-                                     last_ball_xy, frames_since_ball,
-                                     fps=effective_fps)
 
     # Project to pitch coords. Image-space is always on-pitch but approximate;
     # the homography is accurate but goes wild on bad-keypoint frames. So: keep
@@ -431,6 +415,13 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                 ball_pitch = img_ball
             else:
                 ball_pitch = h_ball
+
+    # Continuity gate LAST, now that ball candidates have real pitch
+    # coordinates: the physics of "how far can a ball travel" only makes sense
+    # in metres, not pixels (see _pick_ball).
+    ball_detections, ball_pitch = _pick_ball(
+        ball_detections, np.asarray(ball_pitch, dtype=float).reshape(-1, 2),
+        last_ball_pitch, frames_since_ball, fps=effective_fps)
 
     players_detections.data["pitch_xy"] = players_pitch
     ball_detections.data["pitch_xy"] = ball_pitch
@@ -668,8 +659,8 @@ def track(video_path, output_dir,
 
     players, ball = {}, {}
     frame_number = 1
-    # Last accepted ball centre (pixels) + how long ago, for _pick_ball.
-    last_ball_xy, frames_since_ball = None, 1
+    # Last accepted ball position (pitch cm) + how long ago, for _pick_ball.
+    last_ball_pitch, frames_since_ball = None, 1
     transformer = None  # most recent image->pitch homography
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -707,7 +698,7 @@ def track(video_path, output_dir,
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
             ball_class_id=ball_class_id, player_class_ids=player_class_ids,
             player_conf=DEFAULT_PLAYER_CONF, transformer=transformer,
-            last_ball_xy=last_ball_xy, frames_since_ball=frames_since_ball,
+            last_ball_pitch=last_ball_pitch, frames_since_ball=frames_since_ball,
             effective_fps=effective_fps)
 
         object_ids = all_detections.tracker_id
@@ -727,8 +718,7 @@ def track(video_path, output_dir,
 
         if ball_detections.xyxy.shape[0]:
             b = ball_detections
-            _bb = b.xyxy[0]
-            last_ball_xy = ((_bb[0] + _bb[2]) / 2.0, (_bb[1] + _bb[3]) / 2.0)
+            last_ball_pitch = (ball_pitch_xys[0][0], ball_pitch_xys[0][1])
             frames_since_ball = 1
             ball[str(frame_number)] = {
                 "X1": b.xyxy[0][0], "Y1": b.xyxy[0][1], "X2": b.xyxy[0][2], "Y2": b.xyxy[0][3],
