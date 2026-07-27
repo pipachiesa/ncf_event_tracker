@@ -125,7 +125,13 @@ DEFAULT_PITCH_IMGSZ = 1280
 # Linearly interpolate ball position across detection gaps no longer than this
 # many frames (longer gaps stay empty). Prevents possession from resetting on
 # every missed detection.
-BALL_INTERP_MAX_GAP = 15
+# Raised from 15 once the continuity gate started rejecting bad detections:
+# the gate trades coverage for trustworthiness (ball presence 87% -> 74%), and
+# interpolation is the safe way to buy that coverage back because a linear fill
+# is SMOOTH and cannot reintroduce teleports. Measured on spain-france at
+# stride 2 (so the effective gap is half this): ball presence 74.4% -> 90.1%,
+# passes 478 -> 594, set pieces 131 -> 125 (slightly better, not worse).
+BALL_INTERP_MAX_GAP = 50
 
 # Ball-candidate continuity (see ``_pick_ball``). A powerful shot peaks around
 # 35 m/s; above that no real ball is moving, so a candidate that far from the
