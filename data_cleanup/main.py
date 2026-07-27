@@ -133,6 +133,11 @@ DEFAULT_PITCH_IMGSZ = 1280
 # passes 478 -> 594, set pieces 131 -> 125 (slightly better, not worse).
 BALL_INTERP_MAX_GAP = 50
 
+# How many ball candidates per frame to keep for the global trajectory solver
+# (ball_viterbi.py). The greedy in-loop gate keeps one; these are written to a
+# sidecar so the whole path can be re-optimised offline.
+BALL_CANDIDATES_PER_FRAME = 4
+
 # Ball-candidate continuity (see ``_pick_ball``). A powerful shot peaks around
 # 35 m/s; above that no real ball is moving, so a candidate that far from the
 # last known position is a different white object (penalty spot, line, crowd).
@@ -422,17 +427,38 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
             else:
                 ball_pitch = h_ball
 
+    # Snapshot of EVERY ball candidate with its pitch position, before the
+    # greedy gate throws all but one away. The gate below is causal (it only
+    # looks backwards), so it can lock onto a wrong object and then reject the
+    # real ball as "unreachable" for a while. Keeping the candidates lets
+    # ball_viterbi.py re-solve the whole trajectory globally afterwards, which
+    # recovers exactly those cases -- without re-running detection.
+    ball_pitch_all = np.asarray(ball_pitch, dtype=float).reshape(-1, 2)
+    candidates = []
+    if len(ball_detections):
+        conf_all = ball_detections.confidence
+        order = (np.argsort(-conf_all)[:BALL_CANDIDATES_PER_FRAME]
+                 if conf_all is not None
+                 else range(min(BALL_CANDIDATES_PER_FRAME, len(ball_detections))))
+        for i in order:
+            box = ball_detections.xyxy[i]
+            candidates.append((
+                float(conf_all[i]) if conf_all is not None else 1.0,
+                float(box[0]), float(box[1]), float(box[2]), float(box[3]),
+                float(ball_pitch_all[i][0]), float(ball_pitch_all[i][1]),
+            ))
+
     # Continuity gate LAST, now that ball candidates have real pitch
     # coordinates: the physics of "how far can a ball travel" only makes sense
     # in metres, not pixels (see _pick_ball).
     ball_detections, ball_pitch = _pick_ball(
-        ball_detections, np.asarray(ball_pitch, dtype=float).reshape(-1, 2),
+        ball_detections, ball_pitch_all,
         last_ball_pitch, frames_since_ball, fps=effective_fps)
 
     players_detections.data["pitch_xy"] = players_pitch
     ball_detections.data["pitch_xy"] = ball_pitch
 
-    return players_detections, ball_detections
+    return players_detections, ball_detections, candidates
 
 
 def generate_team_model(video_path, player_model, player_class_ids=(COCO_PERSON,),
@@ -664,6 +690,7 @@ def track(video_path, output_dir,
     frame_generator = sv.get_video_frames_generator(video_path)
 
     players, ball = {}, {}
+    ball_candidates = []      # (frame, conf, x1, y1, x2, y2, x_pitch, y_pitch)
     frame_number = 1
     # Last accepted ball position (pitch cm) + how long ago, for _pick_ball.
     last_ball_pitch, frames_since_ball = None, 1
@@ -700,12 +727,15 @@ def track(video_path, output_dir,
             if new_transformer is not None:
                 transformer = new_transformer
 
-        all_detections, ball_detections = get_detections(
+        all_detections, ball_detections, ball_cands = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
             ball_class_id=ball_class_id, player_class_ids=player_class_ids,
             player_conf=DEFAULT_PLAYER_CONF, transformer=transformer,
             last_ball_pitch=last_ball_pitch, frames_since_ball=frames_since_ball,
             effective_fps=effective_fps)
+
+        for cand in ball_cands:
+            ball_candidates.append((frame_number,) + cand)
 
         object_ids = all_detections.tracker_id
         team_ids = all_detections.class_id
@@ -760,6 +790,14 @@ def track(video_path, output_dir,
     if filled:
         print(f"Interpolated the ball across {filled} missed frame(s) "
               f"(gaps <= {ball_interp_gap}).")
+
+    cand_path = os.path.join(output_dir, video_name + "_ball_candidates.csv")
+    with open(cand_path, "w", newline="") as fh:
+        fh.write("Frame,Conf,X1,Y1,X2,Y2,X_Pitch,Y_Pitch\n")
+        fh.writelines(
+            f"{c[0]},{c[1]:.4f},{c[2]:.1f},{c[3]:.1f},{c[4]:.1f},{c[5]:.1f},"
+            f"{c[6]:.1f},{c[7]:.1f}\n" for c in ball_candidates)
+    print(f"Candidatos de pelota: {cand_path} ({len(ball_candidates)} filas)")
 
     output_path = os.path.join(output_dir, video_name + ".csv")
     save_tracking_results(players, ball, frame_number, output_path)

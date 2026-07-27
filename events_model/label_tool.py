@@ -124,16 +124,20 @@ def load_tracking(path):
     return by_frame
 
 
-def find_static_ball_frames(by_frame, fps, still_px=2.0, min_still_s=1.5):
-    """Frames donde la 'pelota' esta inmovil = casi seguro una marca de cancha.
+def find_suspicious_ball_frames(by_frame, fps, still_px=2.0, min_still_s=1.5,
+                                max_speed_px=None):
+    """Frames donde NO hay que fiarse del marcador de la pelota.
 
-    El detector confunde con la pelota a objetos blancos y chicos que no se
-    mueven (el punto de penal es el caso tipico). Una pelota en juego nunca
-    queda clavada al pixel exacto durante segundos.
+    Dos firmas, ambas imposibles para una pelota en juego:
 
-    NO se borra la deteccion: eliminarlas empeora los eventos (las rachas mas
-    largas resultaron ser la pelota real durante pausas del juego). Solo se
-    marcan para dibujarlas distinto y que no te guien mal al etiquetar.
+    * INMOVIL: clavada al pixel durante segundos -> es una marca de la cancha
+      (el punto de penal es el caso tipico).
+    * TELETRANSPORTE: salta hacia/desde el frame vecino a una velocidad
+      imposible -> ese frame el detector se engancho a otra cosa.
+
+    NO se borra la deteccion (borrarlas empeora los eventos: las rachas mas
+    largas eran la pelota real durante pausas). Solo se dibujan distinto para
+    que no te guien mal al etiquetar.
     """
     balls = []
     for frame in sorted(by_frame):
@@ -142,14 +146,17 @@ def find_static_ball_frames(by_frame, fps, still_px=2.0, min_still_s=1.5):
                 balls.append((frame, (x1 + x2) / 2, (y1 + y2) / 2))
                 break
 
-    suspicious, run = set(), []
+    suspicious = set()
+
+    # --- inmovil ---
+    run = []
     min_len = max(2, int(min_still_s * fps))
 
     def flush():
         if len(run) >= min_len:
             suspicious.update(f for f, _, _ in run)
 
-    for i, (f, cx, cy) in enumerate(balls):
+    for f, cx, cy in balls:
         if not run:
             run.append((f, cx, cy))
             continue
@@ -160,6 +167,22 @@ def find_static_ball_frames(by_frame, fps, still_px=2.0, min_still_s=1.5):
             flush()
             run = [(f, cx, cy)]
     flush()
+
+    # --- teletransporte ---
+    # Sin escala de cancha usamos un umbral en pixeles: un tiro potente recorre
+    # ~35 m/s, que sobre un plano abierto son del orden de 600 px/s.
+    if max_speed_px is None:
+        max_speed_px = 600.0
+    for i in range(1, len(balls)):
+        (f0, x0, y0), (f1, x1, y1) = balls[i - 1], balls[i]
+        df = f1 - f0
+        if not 1 <= df <= 3:
+            continue
+        v = (((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5) / (df / fps)
+        if v > max_speed_px:
+            # No se sabe cual de los dos es el impostor: se marcan ambos.
+            suspicious.add(f0)
+            suspicious.add(f1)
     return suspicious
 
 
@@ -225,7 +248,7 @@ class LabelTool:
                       // self.frame_stride)
         self.events = events
         self.tracking = tracking
-        self.static_ball = find_static_ball_frames(tracking, self.fps)
+        self.static_ball = find_suspicious_ball_frames(tracking, self.fps)
         self.state = state
         self.idx = self._first_pending()
         self.vframe = 0          # frame de video actual (0-based)
@@ -549,6 +572,29 @@ def main():
             print(f"AVISO: no encuentro {meta_path}; asumo frame_stride=1. "
                   f"Si el tracking uso --frame-stride, el video va a ir "
                   f"desincronizado de las cajas.")
+
+    # Diagnostico de la fuente: si el marcador de la pelota miente, etiquetar es
+    # imposible, y la causa mas comun no es el algoritmo sino estar leyendo un
+    # tracking VIEJO. Se imprime que archivo se usa y que tan fiable es.
+    if tracking:
+        fps_eff = (args.fps or 0) or 15.0
+        susp = find_suspicious_ball_frames(tracking, fps_eff)
+        with_ball = sum(1 for f in tracking
+                        if any(o == "ball" for o, *_ in tracking[f]))
+        ev_ok = sum(1 for e in events
+                    if e["start_frame"] in tracking
+                    and e["start_frame"] not in susp
+                    and any(o == "ball" for o, *_ in tracking[e["start_frame"]]))
+        print(f"\nTracking: {tracking_path}")
+        print(f"  frames con pelota: {100.0 * with_ball / max(1, len(tracking)):.1f}%"
+              f" | sospechosos: {100.0 * len(susp) / max(1, with_ball):.1f}%")
+        print(f"  eventos con pelota CONFIABLE: "
+              f"{100.0 * ev_ok / max(1, len(events)):.1f}%")
+        if 100.0 * ev_ok / max(1, len(events)) < 60:
+            print("  ⚠️  Bajo. Si ya re-trackeaste con el fix de continuidad, "
+                  "revisa que este CSV sea el NUEVO (¿lo copiaste sobre "
+                  "tracking.csv?).")
+        print()
 
     tool = LabelTool(video, events, tracking, state, args.fps, frame_stride)
     tool.run()
