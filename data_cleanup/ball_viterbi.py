@@ -129,8 +129,14 @@ def solve(by_frame, fps, max_speed=MAX_SPEED_MS):
     pen = static_penalties(by_frame)
 
     prev_frame = None
-    prev_states = [(None, 0.0, None)]   # (cand_idx, coste, backpointer)
-    back = []                           # por frame: [(estado, puntero)]
+    # Estado: (cand_idx | None, coste, backpointer, ancla)
+    # El ancla es (frame, x, y) de la ULTIMA posicion real del camino. El estado
+    # MISSING la arrastra para que, al volver a ver la pelota, se siga exigiendo
+    # que el salto sea alcanzable desde donde estaba: sin esto el camino puede
+    # "desaparecer" un momento y reaparecer en cualquier punto de la cancha
+    # (medido: la cobertura subia a 89.2% pero los imposibles a 7.4%).
+    prev_states = [(None, 0.0, None, None)]
+    back = []
 
     for f in frames:
         cands = by_frame[f]
@@ -144,11 +150,18 @@ def solve(by_frame, fps, max_speed=MAX_SPEED_MS):
         for j, c in enumerate(cands):
             emis = -math.log(max(1e-3, min(1.0, c[0]))) + pen.get((f, j), 0.0)
             best_cost, best_ptr = float("inf"), None
-            for k, (pidx, pcost, _p) in enumerate(prev_states):
+            for k, (pidx, pcost, _p, anchor) in enumerate(prev_states):
                 if pidx is None:
-                    # Venir de MISSING: sin restriccion espacial (la pelota
-                    # pudo moverse sin ser vista), solo el costo acumulado.
-                    trans = 0.0
+                    if anchor is None:
+                        trans = 0.0          # todavia no vimos la pelota nunca
+                    else:
+                        af, ax, ay = anchor
+                        elapsed = max(1, f - af)
+                        d = math.hypot(c[5] - ax, c[6] - ay)
+                        if d > max_speed * elapsed / fps:
+                            continue         # inalcanzable desde la ultima real
+                        v = d / (elapsed / fps)
+                        trans = SPEED_WEIGHT * max(0.0, v - PLAUSIBLE_SPEED_MS)
                 else:
                     pc = by_frame[prev_frame][pidx]
                     d = math.hypot(c[5] - pc[5], c[6] - pc[6])
@@ -163,20 +176,21 @@ def solve(by_frame, fps, max_speed=MAX_SPEED_MS):
                 if total < best_cost:
                     best_cost, best_ptr = total, k
             if best_ptr is not None:
-                cur_states.append((j, best_cost + emis, best_ptr))
+                cur_states.append((j, best_cost + emis, best_ptr, (f, c[5], c[6])))
                 cur_back.append(best_ptr)
 
         # --- estado MISSING ---
-        best_cost, best_ptr = float("inf"), None
-        for k, (_pidx, pcost, _p) in enumerate(prev_states):
+        best_cost, best_ptr, best_anchor = float("inf"), None, None
+        for k, (pidx, pcost, _p, anchor) in enumerate(prev_states):
             if pcost < best_cost:
                 best_cost, best_ptr = pcost, k
-        cur_states.append((None, best_cost + MISSING_COST, best_ptr))
+                # Al entrar en MISSING se hereda el ancla; si venimos de un
+                # candidato real, ese candidato PASA a ser el ancla.
+                best_anchor = ((prev_frame, by_frame[prev_frame][pidx][5],
+                                by_frame[prev_frame][pidx][6])
+                               if pidx is not None else anchor)
+        cur_states.append((None, best_cost + MISSING_COST, best_ptr, best_anchor))
         cur_back.append(best_ptr)
-
-        if not cur_states:
-            cur_states = [(None, best_cost + MISSING_COST, best_ptr)]
-            cur_back = [best_ptr]
 
         back.append((f, list(cur_states)))
         prev_states = cur_states
@@ -186,7 +200,7 @@ def solve(by_frame, fps, max_speed=MAX_SPEED_MS):
     path = {}
     idx = min(range(len(prev_states)), key=lambda i: prev_states[i][1])
     for f, states in reversed(back):
-        cand_idx, _cost, ptr = states[idx]
+        cand_idx, _cost, ptr, _anchor = states[idx]
         if cand_idx is not None:
             path[f] = by_frame[f][cand_idx]
         idx = ptr if ptr is not None else 0

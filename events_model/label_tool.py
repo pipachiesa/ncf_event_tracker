@@ -47,6 +47,9 @@ import sys
 
 import cv2
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "data_cleanup"))
+
 import matchpaths
 
 CLASS_KEYS = {
@@ -148,12 +151,29 @@ def find_suspicious_ball_frames(by_frame, fps, still_px=2.0, min_still_s=1.5,
 
     suspicious = set()
 
-    # --- inmovil ---
+    # --- inmovil Y RECURRENTE ---
+    # Estar quieta no basta: durante las pausas (que son ~40% del partido) la
+    # pelota REAL esta detenida y su marcador es correcto -- marcar eso como
+    # dudoso solo agrega ruido (llegaba al 42% de los frames). Lo que delata a
+    # una marca de la cancha es volver SIEMPRE al mismo punto: el punto de
+    # penal aparece ahi todo el partido, una pelota parada antes de un tiro
+    # libre no.
+    CELL = 25.0            # pixeles: celda para contar recurrencia
+    RECUR_MIN_S = 12.0     # segundos acumulados en la misma celda
+    occupancy = {}
+    for f, cx, cy in balls:
+        occupancy[(int(cx // CELL), int(cy // CELL))] = \
+            occupancy.get((int(cx // CELL), int(cy // CELL)), 0) + 1
+    recur_min = RECUR_MIN_S * fps
+
     run = []
     min_len = max(2, int(min_still_s * fps))
 
     def flush():
-        if len(run) >= min_len:
+        if len(run) < min_len:
+            return
+        f0, x0, y0 = run[0]
+        if occupancy.get((int(x0 // CELL), int(y0 // CELL)), 0) >= recur_min:
             suspicious.update(f for f, _, _ in run)
 
     for f, cx, cy in balls:
@@ -526,6 +546,12 @@ def main():
                     help="CSV de eventos propuesto por las reglas (override de --match)")
     ap.add_argument("--tracking", default=None,
                     help="CSV crudo de tracking para superponer las cajas (override de --match)")
+    ap.add_argument("--interp-gap", type=int, default=25,
+                    help="DEBE coincidir con el --interp-gap de "
+                         "propose_events.py: las propuestas se calculan sobre "
+                         "la pelota interpolada, asi que el overlay tiene que "
+                         "usar la MISMA pelota o los eventos caen en frames "
+                         "donde el dibujo no muestra nada.")
     ap.add_argument("--fps", type=float, default=None,
                     help="override del fps EFECTIVO del tracking, o sea "
                          "fps_video/frame_stride (default: se deduce del video "
@@ -550,6 +576,13 @@ def main():
     events = load_events(events_path)
     if not events:
         sys.exit("El CSV de eventos esta vacio.")
+    if tracking_path and args.interp_gap > 0:
+        from regen_events import _interpolate_ball_csv
+        tp = os.path.expanduser(tracking_path)
+        meta_src = tp.rsplit(".", 1)[0] + ".meta.json"
+        d, fn = _interpolate_ball_csv(tp, args.interp_gap, meta_src)
+        tracking_path = os.path.join(d, fn)
+
     tracking = load_tracking(os.path.expanduser(tracking_path)) if tracking_path else {}
 
     os.makedirs(os.path.dirname(review_path) or ".", exist_ok=True)

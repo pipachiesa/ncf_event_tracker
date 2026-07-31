@@ -30,6 +30,13 @@ def _interpolate_ball_csv(tracking, gap_max, meta_src):
     """
     import csv
 
+    # Se interpolan TODAS las coordenadas, incluido el bounding box en pixeles.
+    # No alcanza con X_Pitch/Y_Pitch: el label_tool dibuja el marcador de la
+    # pelota a partir del bbox, asi que dejarlo en un valor nominal ponia la
+    # pelota interpolada en el pixel (1,1) -- la esquina de la pantalla -- y
+    # generaba saltos enormes contra los frames reales.
+    KEYS = ("X1", "Y1", "X2", "Y2", "X_Pitch", "Y_Pitch")
+
     rows, ball = [], {}
     with open(tracking) as fh:
         reader = csv.DictReader(fh)
@@ -39,8 +46,9 @@ def _interpolate_ball_csv(tracking, gap_max, meta_src):
             if row["Object"] != "ball":
                 continue
             x, y = float(row["X_Pitch"]), float(row["Y_Pitch"])
-            ball[int(row["Frame"])] = (len(rows) - 1,
-                                       None if (x == 0 and y == 0) else (x, y))
+            vals = None if (x == 0 and y == 0) else \
+                {k: float(row[k]) for k in KEYS}
+            ball[int(row["Frame"])] = (len(rows) - 1, vals)
 
     seen = sorted(f for f, (_i, p) in ball.items() if p)
     filled = 0
@@ -48,17 +56,15 @@ def _interpolate_ball_csv(tracking, gap_max, meta_src):
         gap = b - a - 1
         if not 1 <= gap <= gap_max:
             continue
-        (xa, ya), (xb, yb) = ball[a][1], ball[b][1]
+        va, vb = ball[a][1], ball[b][1]
         for k in range(1, gap + 1):
             frame = a + k
             if frame not in ball:
                 continue
             t = k / (gap + 1)
             row = rows[ball[frame][0]]
-            row["X_Pitch"] = f"{xa + (xb - xa) * t:.2f}"
-            row["Y_Pitch"] = f"{ya + (yb - ya) * t:.2f}"
-            # Bounding box nominal: aguas abajo solo se mira si es distinto de 0.
-            row["X1"] = row["Y1"] = row["X2"] = row["Y2"] = "1"
+            for key in KEYS:
+                row[key] = f"{va[key] + (vb[key] - va[key]) * t:.2f}"
             filled += 1
 
     out = tracking.rsplit(".", 1)[0] + "_interp.csv"
