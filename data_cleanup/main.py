@@ -36,6 +36,7 @@ Ball detection notes:
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -124,7 +125,32 @@ DEFAULT_PITCH_IMGSZ = 1280
 # Linearly interpolate ball position across detection gaps no longer than this
 # many frames (longer gaps stay empty). Prevents possession from resetting on
 # every missed detection.
-BALL_INTERP_MAX_GAP = 15
+# Raised from 15 once the continuity gate started rejecting bad detections:
+# the gate trades coverage for trustworthiness (ball presence 87% -> 74%), and
+# interpolation is the safe way to buy that coverage back because a linear fill
+# is SMOOTH and cannot reintroduce teleports. Measured on spain-france at
+# stride 2 (so the effective gap is half this): ball presence 74.4% -> 90.1%,
+# passes 478 -> 594, set pieces 131 -> 125 (slightly better, not worse).
+BALL_INTERP_MAX_GAP = 50
+
+# How many ball candidates per frame to keep for the global trajectory solver
+# (ball_viterbi.py). The greedy in-loop gate keeps one; these are written to a
+# sidecar so the whole path can be re-optimised offline.
+BALL_CANDIDATES_PER_FRAME = 4
+
+# Ball-candidate continuity (see ``_pick_ball``). A powerful shot peaks around
+# 35 m/s; above that no real ball is moving, so a candidate that far from the
+# last known position is a different white object (penalty spot, line, crowd).
+MAX_BALL_SPEED_MS = 40.0
+# The gate compares distances in PITCH METRES (see _pick_ball), so no pixel
+# scale and no slack term are involved. Two earlier attempts failed here:
+# a 120 px "jitter slack" was ~6.6 m of pitch and by itself licensed ~95 m/s
+# jumps (impossible moves only fell 26.3% -> 17.6%), and gating in pixel space
+# stalled at 12.1% because perspective makes a pixel worth far more metres at
+# the far touchline. Sweep on psg-bayern in pitch space: 40 m/s keeps ~57% of
+# detections at ~2% impossible; 30 m/s reaches 0% but costs 8 more points of
+# coverage, which is not worth it (interpolate_ball bridges short gaps anyway).
+DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed in
 
 # ByteTrack keeps a "lost" player track alive for this many frames before
 # dropping it; a longer buffer reuses the same id across occlusions/missed
@@ -289,10 +315,59 @@ def resolve_player_class_ids(model):
     return ids or [COCO_PERSON]
 
 
+def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
+               fps=DEFAULT_TRACK_FPS):
+    """Choose one ball detection, preferring trajectory continuity.
+
+    Works in PITCH COORDINATES (centimetres), never pixels. An earlier version
+    gated in pixel space and only cut impossible moves 24.5% -> 12.1%, because
+    the homography is perspective: the same pixel distance is a few metres near
+    the camera and many metres at the far touchline, so a pixel radius is far
+    too permissive exactly where play is furthest away. Distances are compared
+    in metres, which is also the unit the "impossible move" metric uses.
+
+    ``last_pitch`` is the previously accepted ball position (cm) or None, and
+    ``gap_frames`` how many frames ago it was seen. Reachability is a HARD
+    filter -- confidence only breaks ties among physically possible candidates,
+    so a high-confidence pitch marking cannot outvote a faint real ball.
+    Returns empty selections when nothing is reachable: leaving the frame blank
+    (interpolate_ball bridges it) beats recording an impossible position.
+
+    Always index Detections with a SLICE (``[i:i+1]``): supervision validates
+    that ``xyxy`` stays 2-D (N, 4) and scalar indexing raises deep inside
+    ``Detections.__post_init__``.
+    """
+    conf = ball_detections.confidence
+    if len(ball_detections) == 0:
+        return ball_detections, ball_pitch
+    if conf is None:
+        return ball_detections[0:1], ball_pitch[0:1]
+    if last_pitch is None:
+        best = int(np.argmax(conf))
+        return ball_detections[best:best + 1], ball_pitch[best:best + 1]
+
+    # Reachable radius in centimetres, growing with the blank gap so a
+    # genuinely lost ball is re-acquired instead of suppressed forever.
+    radius_cm = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)) * 100.0
+
+    reachable = []
+    for i, (x, y) in enumerate(ball_pitch):
+        dist = ((x - last_pitch[0]) ** 2 + (y - last_pitch[1]) ** 2) ** 0.5
+        if dist <= radius_cm:
+            reachable.append((float(conf[i]), -dist, i))
+
+    if not reachable:
+        return ball_detections[0:0], ball_pitch[0:0]
+
+    best = max(reachable)[2]
+    return ball_detections[best:best + 1], ball_pitch[best:best + 1]
+
+
 def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL,
                    player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF,
-                   transformer=None):
+                   transformer=None, last_ball_pitch=None, frames_since_ball=1,
+                   effective_fps=DEFAULT_TRACK_FPS):
     import supervision as sv
 
     # Players: keep the player/goalkeeper classes (drop ball & referee). When a
@@ -314,12 +389,16 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     # Ball: filter to the model's ball class (0 for football models, 32 for COCO).
     ball_all = sv.Detections.from_ultralytics(ball_result)
     ball_detections = ball_all[ball_all.class_id == ball_class_id]
-    # The ball is unique: at low confidence several boxes can fire, so keep only
-    # the single most confident one (a stray false positive must not replace the
-    # real ball).
-    if len(ball_detections) > 1 and ball_detections.confidence is not None:
-        best = int(np.argmax(ball_detections.confidence))
-        ball_detections = ball_detections[best:best + 1]
+    # The ball is unique, so only one box survives. Picking purely by
+    # confidence is WRONG on a fixed camera: the penalty spot, pitch markings
+    # and crowd objects are small white blobs that regularly out-score the real
+    # ball, and each time they do the stored position teleports. Measured on
+    # spain-france: 25% of consecutive ball movements were physically
+    # impossible (p90 = 417 m/s = 1502 km/h), which is what makes possession
+    # flicker and defeats any physics-based possession logic downstream.
+    # So candidates are scored by CONTINUITY first: a candidate reachable from
+    # the last known position at a plausible speed beats a more confident one
+    # that would require teleporting.
 
     # Project to pitch coords. Image-space is always on-pitch but approximate;
     # the homography is accurate but goes wild on bad-keypoint frames. So: keep
@@ -348,10 +427,38 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
             else:
                 ball_pitch = h_ball
 
+    # Snapshot of EVERY ball candidate with its pitch position, before the
+    # greedy gate throws all but one away. The gate below is causal (it only
+    # looks backwards), so it can lock onto a wrong object and then reject the
+    # real ball as "unreachable" for a while. Keeping the candidates lets
+    # ball_viterbi.py re-solve the whole trajectory globally afterwards, which
+    # recovers exactly those cases -- without re-running detection.
+    ball_pitch_all = np.asarray(ball_pitch, dtype=float).reshape(-1, 2)
+    candidates = []
+    if len(ball_detections):
+        conf_all = ball_detections.confidence
+        order = (np.argsort(-conf_all)[:BALL_CANDIDATES_PER_FRAME]
+                 if conf_all is not None
+                 else range(min(BALL_CANDIDATES_PER_FRAME, len(ball_detections))))
+        for i in order:
+            box = ball_detections.xyxy[i]
+            candidates.append((
+                float(conf_all[i]) if conf_all is not None else 1.0,
+                float(box[0]), float(box[1]), float(box[2]), float(box[3]),
+                float(ball_pitch_all[i][0]), float(ball_pitch_all[i][1]),
+            ))
+
+    # Continuity gate LAST, now that ball candidates have real pitch
+    # coordinates: the physics of "how far can a ball travel" only makes sense
+    # in metres, not pixels (see _pick_ball).
+    ball_detections, ball_pitch = _pick_ball(
+        ball_detections, ball_pitch_all,
+        last_ball_pitch, frames_since_ball, fps=effective_fps)
+
     players_detections.data["pitch_xy"] = players_pitch
     ball_detections.data["pitch_xy"] = ball_pitch
 
-    return players_detections, ball_detections
+    return players_detections, ball_detections, candidates
 
 
 def generate_team_model(video_path, player_model, player_class_ids=(COCO_PERSON,),
@@ -474,7 +581,7 @@ def track(video_path, output_dir,
           min_track_frames=DEFAULT_MIN_TRACK_FRAMES, imgsz=DEFAULT_IMGSZ,
           pitch_model_path=DEFAULT_PITCH_MODEL, pitch_conf=DEFAULT_PITCH_CONF,
           homography_every=DEFAULT_HOMOGRAPHY_EVERY, pitch_imgsz=DEFAULT_PITCH_IMGSZ,
-          track_teams=True, generate_video=False, stride=30):
+          track_teams=True, generate_video=False, stride=30, frame_stride=1):
     import supervision as sv
     from ultralytics import YOLO
 
@@ -530,9 +637,38 @@ def track(video_path, output_dir,
     frame_w, frame_h = video_info.width, video_info.height
     fps = int(round(video_info.fps)) or 24
 
+    # ``frame_stride`` runs detection on every Nth video frame: N=2 halves the
+    # GPU cost. The written frame numbers stay CONSECUTIVE (1..M over processed
+    # frames) because lib/ball.py indexes ``frames[frame_number - 1]`` and
+    # event_generator walks ``range(1, match.frames + 1)`` -- gaps would break
+    # both. The real timeline is preserved via the sidecar ``effective_fps``.
+    frame_stride = max(1, int(frame_stride))
+    effective_fps = fps / frame_stride
+
+    # Every frame-count parameter below is expressed in *processed* frames, so
+    # dividing by the stride keeps its meaning in SECONDS unchanged.
+    if frame_stride > 1:
+        track_buffer = max(1, round(track_buffer / frame_stride))
+        min_track_frames = max(1, round(min_track_frames / frame_stride))
+        ball_interp_gap = max(1, round(ball_interp_gap / frame_stride))
+        # ``homography_every`` is deliberately NOT rescaled: it stays in
+        # processed frames, so the pitch model runs ``frame_stride`` times less
+        # often in wall-clock terms. On a fixed/tactical camera the homography
+        # barely moves, so that costs nothing and pays for the second detection
+        # pass. Lower it manually if the camera pans a lot.
+        print(f"frame-stride {frame_stride}: procesando 1 de cada {frame_stride} frames "
+              f"({fps} fps -> {effective_fps:g} fps efectivos).")
+        print(f"  reescalados (conservan su valor en segundos): "
+              f"track-buffer={track_buffer}, min-track-frames={min_track_frames}, "
+              f"ball-interp-gap={ball_interp_gap}")
+        print(f"  homography-every={homography_every} sin reescalar "
+              f"(refresca cada {homography_every * frame_stride} frames de video; "
+              f"OK con camara fija)")
+
     # Longer lost-track buffer => fewer fragmented ids across occlusions.
     try:
-        tracker = sv.ByteTrack(lost_track_buffer=track_buffer, frame_rate=fps)
+        tracker = sv.ByteTrack(lost_track_buffer=track_buffer,
+                               frame_rate=max(1, int(round(effective_fps))))
     except TypeError:  # older supervision signature without these kwargs
         tracker = sv.ByteTrack()
     tracker.reset()
@@ -554,7 +690,10 @@ def track(video_path, output_dir,
     frame_generator = sv.get_video_frames_generator(video_path)
 
     players, ball = {}, {}
+    ball_candidates = []      # (frame, conf, x1, y1, x2, y2, x_pitch, y_pitch)
     frame_number = 1
+    # Last accepted ball position (pitch cm) + how long ago, for _pick_ball.
+    last_ball_pitch, frames_since_ball = None, 1
     transformer = None  # most recent image->pitch homography
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -564,7 +703,12 @@ def track(video_path, output_dir,
         sink.__enter__()
 
     shared_conf = min(DEFAULT_PLAYER_CONF, ball_conf)
-    for frame in tqdm(frame_generator, desc="Collecting Tracking Data..."):
+    for source_index, frame in enumerate(tqdm(frame_generator, desc="Collecting Tracking Data...")):
+        # Skip the frames the stride drops *before* any inference -- decoding is
+        # cheap, the two YOLO passes are what costs.
+        if source_index % frame_stride:
+            continue
+
         if share_model:
             # One pass at the lower confidence; players are re-thresholded in
             # get_detections so their behaviour is unchanged.
@@ -583,10 +727,15 @@ def track(video_path, output_dir,
             if new_transformer is not None:
                 transformer = new_transformer
 
-        all_detections, ball_detections = get_detections(
+        all_detections, ball_detections, ball_cands = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
             ball_class_id=ball_class_id, player_class_ids=player_class_ids,
-            player_conf=DEFAULT_PLAYER_CONF, transformer=transformer)
+            player_conf=DEFAULT_PLAYER_CONF, transformer=transformer,
+            last_ball_pitch=last_ball_pitch, frames_since_ball=frames_since_ball,
+            effective_fps=effective_fps)
+
+        for cand in ball_cands:
+            ball_candidates.append((frame_number,) + cand)
 
         object_ids = all_detections.tracker_id
         team_ids = all_detections.class_id
@@ -605,11 +754,14 @@ def track(video_path, output_dir,
 
         if ball_detections.xyxy.shape[0]:
             b = ball_detections
+            last_ball_pitch = (ball_pitch_xys[0][0], ball_pitch_xys[0][1])
+            frames_since_ball = 1
             ball[str(frame_number)] = {
                 "X1": b.xyxy[0][0], "Y1": b.xyxy[0][1], "X2": b.xyxy[0][2], "Y2": b.xyxy[0][3],
                 "X_Pitch": ball_pitch_xys[0][0], "Y_Pitch": ball_pitch_xys[0][1],
             }
         else:
+            frames_since_ball += 1
             ball[str(frame_number)] = {
                 "X1": 0, "Y1": 0, "X2": 0, "Y2": 0, "X_Pitch": 0, "Y_Pitch": 0,
             }
@@ -639,8 +791,30 @@ def track(video_path, output_dir,
         print(f"Interpolated the ball across {filled} missed frame(s) "
               f"(gaps <= {ball_interp_gap}).")
 
+    cand_path = os.path.join(output_dir, video_name + "_ball_candidates.csv")
+    with open(cand_path, "w", newline="") as fh:
+        fh.write("Frame,Conf,X1,Y1,X2,Y2,X_Pitch,Y_Pitch\n")
+        fh.writelines(
+            f"{c[0]},{c[1]:.4f},{c[2]:.1f},{c[3]:.1f},{c[4]:.1f},{c[5]:.1f},"
+            f"{c[6]:.1f},{c[7]:.1f}\n" for c in ball_candidates)
+    print(f"Candidatos de pelota: {cand_path} ({len(ball_candidates)} filas)")
+
     output_path = os.path.join(output_dir, video_name + ".csv")
     save_tracking_results(players, ball, frame_number, output_path)
+
+    # Sidecar so downstream tools recover the real timeline: with a stride the
+    # CSV's consecutive frame numbers tick at ``effective_fps``, not the video's
+    # fps, and every timestamp would be off by the stride factor without this.
+    meta_path = os.path.join(output_dir, video_name + ".meta.json")
+    with open(meta_path, "w") as meta_file:
+        json.dump({
+            "video": os.path.basename(video_path),
+            "source_fps": fps,
+            "frame_stride": frame_stride,
+            "effective_fps": effective_fps,
+            "tracked_frames": frame_number - 1,
+        }, meta_file, indent=2)
+    print(f"Metadata: {meta_path} (effective_fps={effective_fps:g})")
     return output_path
 
 
@@ -684,6 +858,11 @@ def parse_args():
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
+    parser.add_argument("--frame-stride", type=int, default=1,
+                        help="Run detection on every Nth video frame (2 = half the GPU cost). "
+                             "Frame-count options are rescaled automatically so their meaning "
+                             "in seconds is unchanged; the true timeline is recorded in the "
+                             "sidecar .meta.json. Higher values fragment tracks more.")
     return parser.parse_args()
 
 
@@ -706,6 +885,7 @@ def main():
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
+        frame_stride=args.frame_stride,
     )
     print(f"Tracking data written to: {out}")
 
