@@ -199,3 +199,9 @@ events_model/dataset/test.csv
 # (el raw pesado vive fuera del repo, en ~/football_data/matches/<match>/).
 events_model/dataset/*.mp4
 events_model/dataset/tracking.csv
+
+# datos crudos: van a ~/football_data, no al repo
+events_model/dataset/*/tracking*.csv
+events_model/dataset/*/tracking*.json
+*.zip
+*.patch

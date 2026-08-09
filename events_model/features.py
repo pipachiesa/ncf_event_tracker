@@ -68,6 +68,30 @@ FIELDNAMES = [
     "density_5m_receive", "density_10m_receive",
     # secuencia
     "team_flips_recent",
+    # --- geometria de CAMARA (sin orientar) ---
+    # Medido sobre etiquetas reales: la precision de las propuestas cae de 21%
+    # (tercio cercano a la camara) a 13% (medio) y 6% (tercio lejano), porque
+    # de lejos y de espaldas el detector pierde la pelota. Las features de
+    # arriba estan ORIENTADAS al arco atacado, asi que borran justamente esa
+    # informacion: dos jugadas en lados opuestos quedan con la misma x. Estas
+    # conservan el marco fijo de la camara para que el modelo pueda aprender
+    # "aca abajo el tracking miente mas".
+    "cam_x", "cam_y",
+    # El punto de penal es el falso positivo cronico (el derecho concentra el
+    # 0.48% de las detecciones de pelota, ~10x lo que le tocaria por area).
+    "dist_penalty_spot_m",
+    # Con el juego detenido no hay pases ni perdidas: el 17% de las propuestas
+    # salen con la pelota practicamente quieta.
+    "ball_static_s",
+    # --- FISICA DEL TOQUE en el momento de soltar la pelota ---
+    # Un pase es una PATADA: imprime velocidad y cambia la direccion. Un
+    # artefacto de parpadeo de posesion no toca la pelota, que sigue de largo
+    # igual. El generador ya usa esta idea (paper de FIFA) pero solo como
+    # FILTRO binario; como features el modelo puede graduarla. Hacen falta
+    # porque las features actuales separan muy poco (la mejor da d=0.49) y la
+    # que el modelo mas usaba, ball_det_rate, no separa nada dentro de un
+    # bloque (d=0.02): estaba aprendiendo de que bloque venia la fila.
+    "release_dir_cos", "release_speed_delta", "release_speed_out",
     # etiqueta (vacia si no hay ground truth)
     "label",
 ]
@@ -141,6 +165,50 @@ def transition_features(gen, prev, curr, nxt, recent_teams, fps):
     gap_frames = max(nxt.start_frame - curr.end_frame - 1, 0)
     gap_seconds = max(gap_frames, 1) / fps
 
+    # --- geometria de camara: SIN orientar (marco fijo del video) ---
+    cam = curr.end_loc
+    cam_x = cam[0] if cam else ""
+    cam_y = cam[1] if cam else ""
+    if cam:
+        # Puntos de penal a ~11 m de cada arco, en el centro a lo ancho.
+        pen = 11.0 / pitch.PITCH_LENGTH_M
+        dist_pen = min(pitch.distance_m(cam, (pen, 0.5)),
+                       pitch.distance_m(cam, (1.0 - pen, 0.5)))
+    else:
+        dist_pen = ""
+
+    # Segundos que la pelota lleva sin desplazarse de forma apreciable antes
+    # de la transicion (proxy de balon muerto).
+    static_s = 0.0
+    ref = None
+    for f in range(curr.end_frame, max(1, curr.end_frame - int(8 * fps)) - 1, -1):
+        p = gen._ball_pos.get(f)
+        if p is None:
+            continue
+        if ref is None:
+            ref = p
+            continue
+        if pitch.distance_m(p, ref) > 3.0:
+            break
+        static_s = (curr.end_frame - f) / fps
+
+    # Fisica en el instante de soltar: se compara el tramo de pelota ANTES de
+    # que termine la posesion con el de DESPUES.
+    w_rel = max(2, int(round(0.25 * fps)))
+    seg_in = gen._ball_segment(curr.end_frame - w_rel, curr.end_frame)
+    seg_out = gen._ball_segment(curr.end_frame, curr.end_frame + w_rel)
+    if seg_in and seg_out:
+        li = (seg_in[0] ** 2 + seg_in[1] ** 2) ** 0.5
+        lo_ = (seg_out[0] ** 2 + seg_out[1] ** 2) ** 0.5
+        v_in = li / seg_in[2]
+        v_out = lo_ / seg_out[2]
+        release_cos = ((seg_in[0] * seg_out[0] + seg_in[1] * seg_out[1])
+                       / (li * lo_)) if li > 0.05 and lo_ > 0.05 else ""
+        release_dv = v_out - v_in
+        release_vout = v_out
+    else:
+        release_cos = release_dv = release_vout = ""
+
     d_start = pitch.distance_m(start, goal) if start else ""
     d_end = pitch.distance_m(end, goal) if end else ""
     delta_goal = (d_start - d_end) if start and end else ""
@@ -185,6 +253,12 @@ def transition_features(gen, prev, curr, nxt, recent_teams, fps):
         "density_10m_release": d10_rel,
         "density_5m_receive": d5_rec,
         "density_10m_receive": d10_rec,
+        "cam_x": cam_x, "cam_y": cam_y,
+        "dist_penalty_spot_m": dist_pen,
+        "ball_static_s": round(static_s, 2),
+        "release_dir_cos": release_cos if release_cos == "" else round(release_cos, 3),
+        "release_speed_delta": release_dv if release_dv == "" else round(release_dv, 2),
+        "release_speed_out": release_vout if release_vout == "" else round(release_vout, 2),
         "team_flips_recent": flips,
         "label": "",
     }

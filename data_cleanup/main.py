@@ -152,6 +152,16 @@ MAX_BALL_SPEED_MS = 40.0
 # coverage, which is not worth it (interpolate_ball bridges short gaps anyway).
 DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed in
 
+# --- Deteccion de pelota por RECORTE de alta resolucion ---
+# A 1080p la pelota mide ~9 px (medido: mediana de las cajas detectadas), justo
+# en el limite de lo que YOLO resuelve. Escalar el frame entero a mayor imgsz
+# cuesta cuadratico (imgsz 1920 = 2.25x), pero la pelota esta SIEMPRE en una
+# region chica y predecible. Recortando esa ventana a resolucion NATIVA se
+# consigue la densidad de pixeles de un frame gigante al precio de una
+# inferencia de 640 -- que es como lo resuelven los sistemas comerciales.
+BALL_CROP_SIZE = 640        # lado del recorte en pixeles nativos
+BALL_CROP_CONF_SCALE = 1.0  # el recorte no cambia el umbral, solo la resolucion
+
 # ByteTrack keeps a "lost" player track alive for this many frames before
 # dropping it; a longer buffer reuses the same id across occlusions/missed
 # detections instead of minting a fresh id on every reappearance (which
@@ -163,6 +173,10 @@ DEFAULT_LOST_TRACK_BUFFER = 150
 DEFAULT_MIN_TRACK_FRAMES = 12
 
 # COCO class ids produced by the stock yolov8 weights.
+# Equipo reservado para arqueros: ni Home (0) ni Away (1). Aguas abajo se los
+# puede tratar aparte en vez de contar pases/perdidas contra un equipo inventado.
+GOALKEEPER_TEAM_ID = 2
+
 COCO_PERSON = 0
 COCO_SPORTS_BALL = 32
 
@@ -301,6 +315,22 @@ def resolve_ball_class_id(model):
     return COCO_SPORTS_BALL
 
 
+def resolve_goalkeeper_class_id(model):
+    """Class id del arquero, o None si el modelo no lo distingue.
+
+    El clasificador de equipos hace k-means con DOS grupos sobre el color de
+    camiseta, y el arquero usa un tercer color: cae en cualquiera de los dos al
+    azar. Medido en spain-france: los arqueros salieron 58/42 y 62/38 entre
+    Home y Away, o sea sin senal. Conservar la clase del detector es la unica
+    forma limpia de saber quien es arquero; el color no alcanza.
+    """
+    names = getattr(model, "names", None) or {}
+    for class_id, name in names.items():
+        if str(name).strip().lower() in ("goalkeeper", "goal keeper", "gk"):
+            return int(class_id)
+    return None
+
+
 def resolve_player_class_ids(model):
     """Class ids the tracker should treat as players (players + goalkeepers).
 
@@ -313,6 +343,21 @@ def resolve_player_class_ids(model):
     ids = [int(class_id) for class_id, name in names.items()
            if str(name).strip().lower() in ("player", "goalkeeper", "goal keeper", "person")]
     return ids or [COCO_PERSON]
+
+
+def _ball_crop_window(last_px, vel_px, frame_w, frame_h, size=BALL_CROP_SIZE):
+    """Ventana (x0, y0, x1, y1) centrada donde se PREDICE que esta la pelota.
+
+    Se proyecta la ultima posicion con su velocidad: en una pelota rapida el
+    centro del recorte tiene que adelantarse, si no la jugada se escapa de la
+    ventana justo cuando mas importa (un pase largo).
+    """
+    cx = last_px[0] + vel_px[0]
+    cy = last_px[1] + vel_px[1]
+    half = size // 2
+    x0 = int(max(0, min(frame_w - size, cx - half)))
+    y0 = int(max(0, min(frame_h - size, cy - half)))
+    return x0, y0, x0 + size, y0 + size
 
 
 def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
@@ -366,7 +411,9 @@ def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
 def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL,
                    player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF,
+                   goalkeeper_class_id=None,
                    transformer=None, last_ball_pitch=None, frames_since_ball=1,
+                   ball_crop_result=None, crop_offset=(0, 0),
                    effective_fps=DEFAULT_TRACK_FPS):
     import supervision as sv
 
@@ -379,16 +426,44 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
         players_detections = players_detections[players_detections.confidence >= player_conf]
     players_detections = players_detections.with_nms(threshold=0.5, class_agnostic=True)
     players_detections = tracker.update_with_detections(detections=players_detections)
+    # Se lee DESPUES del filtro de confianza, el NMS y el tracker (que cambian
+    # cuantas detecciones hay) y ANTES del clasificador de equipos, que es
+    # quien sobrescribe ``class_id`` con el equipo.
+    gk_mask = (players_detections.class_id == goalkeeper_class_id
+               if goalkeeper_class_id is not None
+               and players_detections.class_id is not None else None)
 
     if team_classifier and len(players_detections):
         players_crops = [sv.crop_image(frame, xyxy) for xyxy in players_detections.xyxy]
-        players_detections.class_id = team_classifier.predict(players_crops)
+        teams = np.asarray(team_classifier.predict(players_crops))
+        # El arquero lleva un tercer color de camiseta y el clasificador solo
+        # tiene DOS grupos, asi que lo asigna al azar (medido: 58/42 y 62/38).
+        # Se lo marca como equipo 2 en vez de forzarlo a uno de los dos: mejor
+        # "no se" que un dato inventado que despues genera pases y perdidas
+        # fantasma contra el arquero.
+        if goalkeeper_class_id is not None and gk_mask is not None and len(gk_mask):
+            teams = np.where(gk_mask, GOALKEEPER_TEAM_ID, teams)
+        players_detections.class_id = teams
     else:
         players_detections.class_id = np.zeros(len(players_detections), dtype=int)
 
     # Ball: filter to the model's ball class (0 for football models, 32 for COCO).
     ball_all = sv.Detections.from_ultralytics(ball_result)
     ball_detections = ball_all[ball_all.class_id == ball_class_id]
+
+    # Candidatos extra del recorte de alta resolucion. Sus coordenadas son
+    # relativas al recorte, asi que se trasladan al frame completo antes de
+    # mezclarlos: a partir de aca son un candidato mas, indistinguible de los
+    # del frame entero, y el gate de continuidad decide.
+    if ball_crop_result is not None:
+        crop_all = sv.Detections.from_ultralytics(ball_crop_result)
+        crop_ball = crop_all[crop_all.class_id == ball_class_id]
+        if len(crop_ball):
+            crop_ball.xyxy = crop_ball.xyxy + np.array(
+                [crop_offset[0], crop_offset[1], crop_offset[0], crop_offset[1]],
+                dtype=crop_ball.xyxy.dtype)
+            ball_detections = sv.Detections.merge([ball_detections, crop_ball]) \
+                if len(ball_detections) else crop_ball
     # The ball is unique, so only one box survives. Picking purely by
     # confidence is WRONG on a fixed camera: the penalty spot, pitch markings
     # and crowd objects are small white blobs that regularly out-score the real
@@ -581,7 +656,8 @@ def track(video_path, output_dir,
           min_track_frames=DEFAULT_MIN_TRACK_FRAMES, imgsz=DEFAULT_IMGSZ,
           pitch_model_path=DEFAULT_PITCH_MODEL, pitch_conf=DEFAULT_PITCH_CONF,
           homography_every=DEFAULT_HOMOGRAPHY_EVERY, pitch_imgsz=DEFAULT_PITCH_IMGSZ,
-          track_teams=True, generate_video=False, stride=30, frame_stride=1):
+          track_teams=True, generate_video=False, stride=30, frame_stride=1,
+          ball_crop=False):
     import supervision as sv
     from ultralytics import YOLO
 
@@ -595,6 +671,11 @@ def track(video_path, output_dir,
         resolved_player_path = FALLBACK_PLAYER_MODEL
         player_model = YOLO(FALLBACK_PLAYER_MODEL)
     player_class_ids = resolve_player_class_ids(player_model)
+    goalkeeper_class_id = resolve_goalkeeper_class_id(player_model)
+    if goalkeeper_class_id is not None:
+        print(f"Arqueros identificados por clase (id {goalkeeper_class_id}) y "
+              f"marcados como equipo {GOALKEEPER_TEAM_ID} (el clasificador de "
+              f"color no los distingue).")
 
     # Resolve the ball model. If it resolves to the same weights as the player
     # model, reuse it and run a single inference per frame.
@@ -694,6 +775,8 @@ def track(video_path, output_dir,
     frame_number = 1
     # Last accepted ball position (pitch cm) + how long ago, for _pick_ball.
     last_ball_pitch, frames_since_ball = None, 1
+    # Posicion y velocidad de la pelota en PIXELES, para centrar el recorte.
+    last_ball_px, ball_vel_px = None, (0.0, 0.0)
     transformer = None  # most recent image->pitch homography
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -718,6 +801,21 @@ def track(video_path, output_dir,
             player_result = player_model(frame, conf=DEFAULT_PLAYER_CONF, imgsz=imgsz, verbose=False)[0]
             ball_result = ball_model(frame, conf=ball_conf, imgsz=imgsz, verbose=False)[0]
 
+        # Recorte de alta resolucion alrededor de la pelota predicha. Solo se
+        # hace si ya sabemos donde estaba: sin historial no hay donde recortar.
+        ball_crop_result, crop_offset = None, (0, 0)
+        if ball_crop and last_ball_px is not None:
+            x0, y0, x1, y1 = _ball_crop_window(
+                last_ball_px, ball_vel_px, frame_w, frame_h)
+            crop = frame[y0:y1, x0:x1]
+            if crop.size:
+                # imgsz = el lado del recorte: se procesa a resolucion NATIVA,
+                # sin reescalar, que es todo el truco.
+                ball_crop_result = ball_model(crop, conf=ball_conf,
+                                              imgsz=BALL_CROP_SIZE,
+                                              verbose=False)[0]
+                crop_offset = (x0, y0)
+
         # Refresh the homography every ``homography_every`` frames; reuse the
         # last good transform in between (and keep it if a frame has too few
         # keypoints to solve a new one).
@@ -730,9 +828,11 @@ def track(video_path, output_dir,
         all_detections, ball_detections, ball_cands = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
             ball_class_id=ball_class_id, player_class_ids=player_class_ids,
+            goalkeeper_class_id=goalkeeper_class_id,
             player_conf=DEFAULT_PLAYER_CONF, transformer=transformer,
             last_ball_pitch=last_ball_pitch, frames_since_ball=frames_since_ball,
-            effective_fps=effective_fps)
+            effective_fps=effective_fps,
+            ball_crop_result=ball_crop_result, crop_offset=crop_offset)
 
         for cand in ball_cands:
             ball_candidates.append((frame_number,) + cand)
@@ -755,6 +855,11 @@ def track(video_path, output_dir,
         if ball_detections.xyxy.shape[0]:
             b = ball_detections
             last_ball_pitch = (ball_pitch_xys[0][0], ball_pitch_xys[0][1])
+            _bb = b.xyxy[0]
+            px = ((_bb[0] + _bb[2]) / 2.0, (_bb[1] + _bb[3]) / 2.0)
+            if last_ball_px is not None:
+                ball_vel_px = (px[0] - last_ball_px[0], px[1] - last_ball_px[1])
+            last_ball_px = px
             frames_since_ball = 1
             ball[str(frame_number)] = {
                 "X1": b.xyxy[0][0], "Y1": b.xyxy[0][1], "X2": b.xyxy[0][2], "Y2": b.xyxy[0][3],
@@ -858,6 +963,14 @@ def parse_args():
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
+    parser.add_argument("--ball-crop", action="store_true",
+                        help="Ademas del frame completo, corre el modelo de "
+                             "pelota sobre un recorte de 640 px a resolucion "
+                             "NATIVA centrado donde se predice la pelota. A "
+                             "1080p la pelota mide ~9 px; en el recorte "
+                             "conserva su tamano real. Cuesta como una "
+                             "inferencia de 640 (barato) y da candidatos que "
+                             "el frame completo pierde.")
     parser.add_argument("--frame-stride", type=int, default=1,
                         help="Run detection on every Nth video frame (2 = half the GPU cost). "
                              "Frame-count options are rescaled automatically so their meaning "
@@ -886,6 +999,7 @@ def main():
         generate_video=args.generate_video,
         stride=args.stride,
         frame_stride=args.frame_stride,
+        ball_crop=args.ball_crop,
     )
     print(f"Tracking data written to: {out}")
 
