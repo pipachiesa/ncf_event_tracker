@@ -73,20 +73,44 @@ def load_label_blocks(paths):
     return blocks
 
 
-def build_rows(tracking, blocks, target):
-    """Filas de features restringidas a los bloques etiquetados, con su bloque."""
+def build_rows(tracking, blocks, target, reviewed=None):
+    """Filas de features de las transiciones REVISADAS, con su bloque.
+
+    ``reviewed`` son los frames de TODAS las propuestas que pasaron por el
+    label_tool, incluidas las rechazadas. Es imprescindible cuando el tracking
+    cambio despues de etiquetar: un tracking mejor detecta MAS transiciones
+    reales, y esas nuevas no tienen etiqueta. Contarlas como negativas le
+    ensena al modelo que pases reales "no son pases" -- fue exactamente lo que
+    paso al mejorar la deteccion de pelota (PASS 153->131, no-PASS 136->161,
+    AUC 0.678->0.593). Si no se pasa, se conserva el comportamiento viejo.
+    """
     rows = feat.extract(tracking, "match", labels_csv=None)
     all_labels = [lab for _n, _a, _b, labs in blocks for lab in labs]
     rows = feat.attach_labels(rows, all_labels)
 
     out = []
+    skipped = 0
     for row in rows:
         for name, lo, hi, _labs in blocks:
-            if lo <= row["start_frame"] <= hi:
-                row["block"] = name
-                row["y"] = 1 if row["label"] == target else 0
-                out.append(row)
-                break
+            if not (lo <= row["start_frame"] <= hi):
+                continue
+            if reviewed is not None and row["label"] == "NONE":
+                # Sin etiqueta: solo es un negativo REAL si esa transicion
+                # corresponde a una propuesta que revisaste y rechazaste.
+                near = any(abs(f - row["start_frame"]) <= BLOCK_PAD or
+                           abs(f - row["end_frame"]) <= BLOCK_PAD
+                           for f in reviewed)
+                if not near:
+                    skipped += 1
+                    break
+            row["block"] = name
+            row["y"] = 1 if row["label"] == target else 0
+            out.append(row)
+            break
+    if skipped:
+        print(f"descartadas {skipped} transiciones NUEVAS sin revisar "
+              f"(el tracking cambio desde que etiquetaste; contarlas como "
+              f"negativas seria inventar datos)")
     return out
 
 
@@ -131,7 +155,12 @@ def main():
     for name, lo, hi, labs in blocks:
         print(f"  {name:<34} frames {max(0,lo):>6}-{hi:<6} ({len(labs)} eventos)")
 
-    rows = build_rows(os.path.expanduser(args.tracking), blocks, args.target)
+    reviewed = None
+    if args.proposals:
+        reviewed = sorted(int(float(r["Start Frame"]))
+                          for r in csv.DictReader(open(os.path.expanduser(args.proposals))))
+    rows = build_rows(os.path.expanduser(args.tracking), blocks, args.target,
+                      reviewed=reviewed)
     if args.exclude_block:
         before = len(rows)
         rows = [r for r in rows if r["block"] not in args.exclude_block]

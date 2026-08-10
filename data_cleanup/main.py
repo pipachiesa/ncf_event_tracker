@@ -159,6 +159,20 @@ DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed 
 # region chica y predecible. Recortando esa ventana a resolucion NATIVA se
 # consigue la densidad de pixeles de un frame gigante al precio de una
 # inferencia de 640 -- que es como lo resuelven los sistemas comerciales.
+# --- Veto del punto de penal ---
+# El detector confunde cronicamente la marca de penal con la pelota (medido:
+# 2x sobre-representada por area, y el 54% de esas detecciones estan QUIETAS).
+# La clave es que trabajamos en coordenadas de CANCHA, no de imagen: la camara
+# se mueve, pero tras la homografia la marca queda SIEMPRE en el mismo punto,
+# y ademas sabemos donde esta (11 m del arco, al centro). No hace falta
+# detectarla: se puede vetar por geometria.
+# El veto exige LAS DOS condiciones -- estar sobre la marca Y no haberse
+# movido -- porque la pelota real pasa por ahi todo el tiempo y ademas existen
+# los penales. Vetar la zona a secas perderia jugadas legitimas.
+PENALTY_SPOT_M = 11.0        # distancia del arco a la marca
+PENALTY_VETO_R_CM = 120.0    # radio del veto alrededor de la marca
+PENALTY_STATIC_CM = 40.0     # movimiento por debajo del cual se considera quieta
+
 BALL_CROP_SIZE = 640        # lado del recorte en pixeles nativos
 BALL_CROP_CONF_SCALE = 1.0  # el recorte no cambia el umbral, solo la resolucion
 
@@ -395,11 +409,22 @@ def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
     # genuinely lost ball is re-acquired instead of suppressed forever.
     radius_cm = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)) * 100.0
 
+    # Marcas de penal en coordenadas de cancha (cm).
+    pen_x = PENALTY_SPOT_M / 105.0 * PITCH_LENGTH_CM
+    spots = ((pen_x, PITCH_WIDTH_CM / 2.0),
+             (PITCH_LENGTH_CM - pen_x, PITCH_WIDTH_CM / 2.0))
+
     reachable = []
     for i, (x, y) in enumerate(ball_pitch):
         dist = ((x - last_pitch[0]) ** 2 + (y - last_pitch[1]) ** 2) ** 0.5
-        if dist <= radius_cm:
-            reachable.append((float(conf[i]), -dist, i))
+        if dist > radius_cm:
+            continue
+        # Sobre la marca de penal Y sin moverse => es la marca, no la pelota.
+        on_spot = any(((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 <= PENALTY_VETO_R_CM
+                      for sx, sy in spots)
+        if on_spot and dist <= PENALTY_STATIC_CM:
+            continue
+        reachable.append((float(conf[i]), -dist, i))
 
     if not reachable:
         return ball_detections[0:0], ball_pitch[0:0]
