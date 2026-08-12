@@ -171,7 +171,15 @@ DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed 
 # los penales. Vetar la zona a secas perderia jugadas legitimas.
 PENALTY_SPOT_M = 11.0        # distancia del arco a la marca
 PENALTY_VETO_R_CM = 120.0    # radio del veto alrededor de la marca
-PENALTY_STATIC_CM = 40.0     # movimiento por debajo del cual se considera quieta
+# Frames seguidos que la pelota puede estar SOBRE la marca antes de vetarla.
+# La pelota real CRUZA la marca (uno o dos frames); lo que nunca hace es
+# quedarse. Una version anterior exigia "sobre la marca Y sin moverse respecto
+# al frame anterior", y no servia: el enganche EMPIEZA con un salto desde la
+# pelota real hasta la marca, y ese primer salto pasaba el filtro. Peor, en los
+# ultimos tercios la pelota suele estar a pocos metros de la marca, asi que el
+# salto entraba dentro del radio alcanzable. Contar frames consecutivos ataca
+# la firma real: engancharse y NO soltar.
+PENALTY_MAX_FRAMES_ON_SPOT = 3
 
 BALL_CROP_SIZE = 640        # lado del recorte en pixeles nativos
 BALL_CROP_CONF_SCALE = 1.0  # el recorte no cambia el umbral, solo la resolucion
@@ -374,8 +382,18 @@ def _ball_crop_window(last_px, vel_px, frame_w, frame_h, size=BALL_CROP_SIZE):
     return x0, y0, x0 + size, y0 + size
 
 
+def on_penalty_spot(x, y):
+    """True si un punto (cm) cae sobre alguna marca de penal."""
+    pen_x = PENALTY_SPOT_M / 105.0 * PITCH_LENGTH_CM
+    for sx, sy in ((pen_x, PITCH_WIDTH_CM / 2.0),
+                   (PITCH_LENGTH_CM - pen_x, PITCH_WIDTH_CM / 2.0)):
+        if ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 <= PENALTY_VETO_R_CM:
+            return True
+    return False
+
+
 def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
-               fps=DEFAULT_TRACK_FPS):
+               fps=DEFAULT_TRACK_FPS, frames_on_spot=0):
     """Choose one ball detection, preferring trajectory continuity.
 
     Works in PITCH COORDINATES (centimetres), never pixels. An earlier version
@@ -409,20 +427,16 @@ def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
     # genuinely lost ball is re-acquired instead of suppressed forever.
     radius_cm = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)) * 100.0
 
-    # Marcas de penal en coordenadas de cancha (cm).
-    pen_x = PENALTY_SPOT_M / 105.0 * PITCH_LENGTH_CM
-    spots = ((pen_x, PITCH_WIDTH_CM / 2.0),
-             (PITCH_LENGTH_CM - pen_x, PITCH_WIDTH_CM / 2.0))
+    # Si la pelota ya lleva demasiados frames seguidos sobre una marca de penal,
+    # dejo de aceptar candidatos ahi: cruzarla es normal, quedarse no.
+    veto_spot = frames_on_spot >= PENALTY_MAX_FRAMES_ON_SPOT
 
     reachable = []
     for i, (x, y) in enumerate(ball_pitch):
         dist = ((x - last_pitch[0]) ** 2 + (y - last_pitch[1]) ** 2) ** 0.5
         if dist > radius_cm:
             continue
-        # Sobre la marca de penal Y sin moverse => es la marca, no la pelota.
-        on_spot = any(((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 <= PENALTY_VETO_R_CM
-                      for sx, sy in spots)
-        if on_spot and dist <= PENALTY_STATIC_CM:
+        if veto_spot and on_penalty_spot(x, y):
             continue
         reachable.append((float(conf[i]), -dist, i))
 
@@ -439,6 +453,7 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    goalkeeper_class_id=None,
                    transformer=None, last_ball_pitch=None, frames_since_ball=1,
                    ball_crop_result=None, crop_offset=(0, 0),
+                   frames_on_spot=0,
                    effective_fps=DEFAULT_TRACK_FPS):
     import supervision as sv
 
@@ -553,7 +568,8 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     # in metres, not pixels (see _pick_ball).
     ball_detections, ball_pitch = _pick_ball(
         ball_detections, ball_pitch_all,
-        last_ball_pitch, frames_since_ball, fps=effective_fps)
+        last_ball_pitch, frames_since_ball, fps=effective_fps,
+        frames_on_spot=frames_on_spot)
 
     players_detections.data["pitch_xy"] = players_pitch
     ball_detections.data["pitch_xy"] = ball_pitch
@@ -802,6 +818,7 @@ def track(video_path, output_dir,
     last_ball_pitch, frames_since_ball = None, 1
     # Posicion y velocidad de la pelota en PIXELES, para centrar el recorte.
     last_ball_px, ball_vel_px = None, (0.0, 0.0)
+    frames_on_spot = 0   # frames seguidos con la pelota sobre una marca de penal
     transformer = None  # most recent image->pitch homography
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -857,7 +874,8 @@ def track(video_path, output_dir,
             player_conf=DEFAULT_PLAYER_CONF, transformer=transformer,
             last_ball_pitch=last_ball_pitch, frames_since_ball=frames_since_ball,
             effective_fps=effective_fps,
-            ball_crop_result=ball_crop_result, crop_offset=crop_offset)
+            ball_crop_result=ball_crop_result, crop_offset=crop_offset,
+            frames_on_spot=frames_on_spot)
 
         for cand in ball_cands:
             ball_candidates.append((frame_number,) + cand)
@@ -880,6 +898,8 @@ def track(video_path, output_dir,
         if ball_detections.xyxy.shape[0]:
             b = ball_detections
             last_ball_pitch = (ball_pitch_xys[0][0], ball_pitch_xys[0][1])
+            frames_on_spot = (frames_on_spot + 1
+                              if on_penalty_spot(*last_ball_pitch) else 0)
             _bb = b.xyxy[0]
             px = ((_bb[0] + _bb[2]) / 2.0, (_bb[1] + _bb[3]) / 2.0)
             if last_ball_px is not None:
