@@ -112,7 +112,28 @@ PITCH_MODEL_FILE = "yolo-football-pitch-detection.pt"
 # Minimum keypoint confidence to use a landmark in the homography, and minimum
 # number of confident landmarks needed to solve one.
 DEFAULT_PITCH_CONF = 0.5
-MIN_HOMOGRAPHY_POINTS = 4
+# MEDIDO (spain-france, 89.027 frames): con el minimo de 4 puntos, en el 6,4% de
+# los frames TODO el plantel salta mas de 1 m de golpe, y en el 1,7% mas de
+# 10 m. El 93,6% de esos saltos cae en frames multiplo de ``homography_every``,
+# o sea justo cuando se re-estima la transformacion -- no son los jugadores
+# moviendose, es el sistema de coordenadas. Cuatro puntos son el minimo EXACTO
+# para resolver una homografia: no sobra ninguno, asi que el error de
+# reproyeccion es cero por construccion y es imposible saber si la solucion es
+# buena. Con 6 hay redundancia y el error se vuelve medible.
+MIN_HOMOGRAPHY_POINTS = 6
+# Error de reproyeccion maximo tolerado (cm): se proyectan los propios keypoints
+# y se comparan con su posicion conocida en la cancha.
+MAX_REPROJECTION_CM = 300.0
+# Los keypoints tienen que estar REPARTIDOS. Cuatro puntos amontonados en una
+# esquina resuelven una homografia perfecta localmente y disparatada en el resto
+# del campo, que es de donde salen los errores de 25 m. Se exige que la caja que
+# los contiene cubra algo de la imagen y que no esten casi alineados.
+MIN_KEYPOINT_SPREAD = 0.15   # fraccion del ancho/alto de imagen
+MIN_KEYPOINT_ASPECT = 0.08   # razon entre los dos ejes principales
+# Cuanto puede moverse el mundo de un refresco al siguiente antes de sospechar.
+# La camara paneando mueve el campo suavemente; un salto de varios metros entre
+# dos frames consecutivos es la transformacion rompiendose, no la camara.
+MAX_HOMOGRAPHY_JUMP_CM = 250.0
 # Recompute the homography every N frames (the camera pans smoothly, so we reuse
 # the last transform in between to avoid a keypoint pass on every frame).
 DEFAULT_HOMOGRAPHY_EVERY = 5
@@ -159,27 +180,46 @@ DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed 
 # region chica y predecible. Recortando esa ventana a resolucion NATIVA se
 # consigue la densidad de pixeles de un frame gigante al precio de una
 # inferencia de 640 -- que es como lo resuelven los sistemas comerciales.
-# --- Veto del punto de penal ---
-# El detector confunde cronicamente la marca de penal con la pelota (medido:
-# 2x sobre-representada por area, y el 54% de esas detecciones estan QUIETAS).
-# La clave es que trabajamos en coordenadas de CANCHA, no de imagen: la camara
-# se mueve, pero tras la homografia la marca queda SIEMPRE en el mismo punto,
-# y ademas sabemos donde esta (11 m del arco, al centro). No hace falta
-# detectarla: se puede vetar por geometria.
-# El veto exige LAS DOS condiciones -- estar sobre la marca Y no haberse
-# movido -- porque la pelota real pasa por ahi todo el tiempo y ademas existen
-# los penales. Vetar la zona a secas perderia jugadas legitimas.
-PENALTY_SPOT_M = 11.0        # distancia del arco a la marca
-PENALTY_VETO_R_CM = 120.0    # radio del veto alrededor de la marca
-# Frames seguidos que la pelota puede estar SOBRE la marca antes de vetarla.
-# La pelota real CRUZA la marca (uno o dos frames); lo que nunca hace es
-# quedarse. Una version anterior exigia "sobre la marca Y sin moverse respecto
-# al frame anterior", y no servia: el enganche EMPIEZA con un salto desde la
-# pelota real hasta la marca, y ese primer salto pasaba el filtro. Peor, en los
-# ultimos tercios la pelota suele estar a pocos metros de la marca, asi que el
-# salto entraba dentro del radio alcanzable. Contar frames consecutivos ataca
-# la firma real: engancharse y NO soltar.
-PENALTY_MAX_FRAMES_ON_SPOT = 3
+# --- Veto de ENGANCHE A OBJETO QUIETO ---
+# El detector se engancha cronicamente a objetos blancos e inmoviles: la marca
+# de penal sobre todo, pero tambien el punto central, botellas y toallas al
+# borde del campo, banderines de corner y las pelotas de calentamiento.
+#
+# DOS INTENTOS FALLIDOS ANTES DE ESTE, y por que fallaron:
+#   1. "vetar si esta sobre la marca Y no se movio respecto al frame anterior":
+#      el enganche EMPIEZA con un salto desde la pelota real hasta la marca, y
+#      ese primer frame pasaba el filtro.
+#   2. "vetar tras N frames seguidos sobre la marca", con la marca ubicada por
+#      geometria (11 m del arco, radio 1,2 m). MEDIDO sobre el clip de 3 min:
+#      las rachas quietas mas largas caen a 3,5 y 4,5 m de la marca nominal --
+#      TRES VECES el radio del veto, asi que nunca se disparaba. El error no
+#      era el umbral sino la premisa: la homografia tiene varios metros de
+#      error, y encima solo cubria la marca de penal.
+#
+# ESTE ENFOQUE NO NECESITA SABER DONDE ESTAN LAS MARCAS. Usa la unica firma
+# que comparten todos estos objetos y que la pelota real no tiene: no se
+# mueven. Es la idea de Felipe ("un constraint de que la pelota se tiene que
+# mover"), y al no depender de la geometria tampoco depende de la homografia.
+#
+# MEDIDO en el clip de 3 min: el 53% de los frames con pelota caen en rachas
+# QUIETAS de 8+ frames (la mas larga, 121 frames = 8 segundos seguidos).
+STATIC_MOVE_CM = 80.0        # menos de 0,8 m entre frames = no se movio
+STATIC_MAX_FRAMES = 8        # frames quieto antes de declarar enganche
+# Radio alrededor de la posicion enganchada que queda "quemado", y por cuantos
+# frames. Quemado NO significa prohibido: significa que pierde contra
+# cualquier otro candidato (ver _pick_ball). Esa distincion es la que permite
+# conservar las pelotas legitimamente quietas -- tiros libres, corners, saques
+# -- donde el objeto quieto es la UNICA deteccion y por lo tanto gana igual.
+STATIC_BURN_R_CM = 250.0
+STATIC_BURN_FRAMES = 150
+# Margen (fraccion del campo) fuera del cual un candidato a pelota se descarta
+# de entrada. La pelota sale del campo de verdad (lateral, corner), asi que el
+# margen es generoso; lo que se corta son las botellas y las pelotas de
+# calentamiento del costado. MEDIDO: 7,0% de los frames con pelota del clip
+# caen fuera de los limites. Descartar en la SELECCION es estrictamente mejor
+# que limpiar despues (clean_offpitch.py): aca todavia hay otro candidato al
+# que recurrir, despues solo queda borrar el frame.
+BALL_OFFPITCH_MARGIN = 0.04
 
 BALL_CROP_SIZE = 640        # lado del recorte en pixeles nativos
 BALL_CROP_CONF_SCALE = 1.0  # el recorte no cambia el umbral, solo la resolucion
@@ -264,11 +304,14 @@ def resolve_pitch_model_path(spec):
 
 
 def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
-                            min_points=MIN_HOMOGRAPHY_POINTS):
+                            min_points=MIN_HOMOGRAPHY_POINTS,
+                            frame_w=None, frame_h=None):
     """Build an image->pitch ``ViewTransformer`` from detected pitch keypoints.
 
-    Returns the transformer, or None when too few confident landmarks were
-    found to solve a homography (caller then reuses the last good transform).
+    Devuelve ``(transformer, error_reproyeccion_cm, keypoints)`` o ``None`` si
+    la solucion no pasa los controles de calidad (pocos puntos, puntos
+    degenerados o error de reproyeccion alto), en cuyo caso el llamador reusa
+    la ultima transformacion buena.
     """
     import supervision as sv
     try:
@@ -287,10 +330,39 @@ def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
 
     frame_pts = key_points.xy[0][mask].astype(np.float32)
     pitch_pts = np.array(SoccerPitchConfiguration().vertices)[mask].astype(np.float32)
+
+    # Configuracion degenerada: puntos amontonados o casi alineados. Resuelven
+    # una homografia exacta cerca de ellos y absurda lejos, y como el balon y
+    # los jugadores suelen estar lejos, el disparate cae justo donde importa.
+    span = frame_pts.max(axis=0) - frame_pts.min(axis=0)
+    if frame_w and frame_h:
+        if (span[0] < MIN_KEYPOINT_SPREAD * frame_w or
+                span[1] < MIN_KEYPOINT_SPREAD * frame_h):
+            return None
+    centred = frame_pts - frame_pts.mean(axis=0)
     try:
-        return ViewTransformer(source=frame_pts, target=pitch_pts)
+        sing = np.linalg.svd(centred, compute_uv=False)
+        if sing[0] <= 0 or sing[-1] / sing[0] < MIN_KEYPOINT_ASPECT:
+            return None
+    except np.linalg.LinAlgError:
+        return None
+
+    try:
+        transformer = ViewTransformer(source=frame_pts, target=pitch_pts)
     except Exception:
         return None
+
+    # Error de reproyeccion: con >= 6 puntos sobra informacion, asi que se
+    # puede medir si la solucion es buena en vez de asumirlo. Con 4 puntos esto
+    # daria 0 siempre y no diria nada.
+    try:
+        back = transformer.transform_points(points=frame_pts)
+    except Exception:
+        return None
+    err = float(np.median(np.linalg.norm(back - pitch_pts, axis=1)))
+    if not np.isfinite(err) or err > MAX_REPROJECTION_CM:
+        return None
+    return transformer, err, frame_pts
 
 
 def anchors_to_pitch(detections, transformer):
@@ -382,18 +454,61 @@ def _ball_crop_window(last_px, vel_px, frame_w, frame_h, size=BALL_CROP_SIZE):
     return x0, y0, x0 + size, y0 + size
 
 
-def on_penalty_spot(x, y):
-    """True si un punto (cm) cae sobre alguna marca de penal."""
-    pen_x = PENALTY_SPOT_M / 105.0 * PITCH_LENGTH_CM
-    for sx, sy in ((pen_x, PITCH_WIDTH_CM / 2.0),
-                   (PITCH_LENGTH_CM - pen_x, PITCH_WIDTH_CM / 2.0)):
-        if ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5 <= PENALTY_VETO_R_CM:
+def _ball_offpitch(x, y, margin=BALL_OFFPITCH_MARGIN):
+    """True si un candidato a pelota cae fuera del campo con margen."""
+    return (x < -margin * PITCH_LENGTH_CM or x > (1 + margin) * PITCH_LENGTH_CM or
+            y < -margin * PITCH_WIDTH_CM or y > (1 + margin) * PITCH_WIDTH_CM)
+
+
+class StaticGuard:
+    """Detecta que la pelota se engancho a algo QUIETO y rompe el enganche.
+
+    POR QUE HACE FALTA ROMPER EL ANCLA, no solo vetar la posicion: el filtro de
+    continuidad de ``_pick_ball`` acepta candidatos dentro de un radio medido
+    desde la ULTIMA posicion aceptada. Cuando esa ultima posicion es una marca
+    de penal, el enganche se auto-alimenta: la marca esta a distancia CERO y
+    siempre es alcanzable, mientras que la pelota real -- que se fue jugando a
+    treinta metros -- queda fuera del radio y se descarta como imposible. El
+    seguimiento no se recupera solo nunca; hay que soltar el ancla a mano.
+
+    Al soltarla (``last_pitch = None``), el frame siguiente re-adquiere por
+    confianza sin restriccion de distancia, y la posicion enganchada queda
+    "quemada" un rato para que no la vuelva a agarrar de inmediato.
+    """
+
+    def __init__(self):
+        self.count = 0
+        self.burned = []      # [(x, y, frame_en_que_expira)]
+
+    def update(self, xy, prev_xy, frame_number):
+        """Devuelve True si hay que SOLTAR el ancla en este frame."""
+        if xy is None or prev_xy is None:
+            self.count = 0
+            return False
+        moved = ((xy[0] - prev_xy[0]) ** 2 + (xy[1] - prev_xy[1]) ** 2) ** 0.5
+        self.count = self.count + 1 if moved < STATIC_MOVE_CM else 0
+        if self.count >= STATIC_MAX_FRAMES:
+            self._burn(xy, frame_number)
+            self.count = 0
             return True
-    return False
+        return False
+
+    def _burn(self, xy, frame_number):
+        expira = frame_number + STATIC_BURN_FRAMES
+        for i, (bx, by, _e) in enumerate(self.burned):
+            if ((xy[0] - bx) ** 2 + (xy[1] - by) ** 2) ** 0.5 < STATIC_BURN_R_CM:
+                self.burned[i] = (bx, by, expira)   # refresca, no duplica
+                return
+        self.burned.append((float(xy[0]), float(xy[1]), expira))
+
+    def is_burned(self, x, y, frame_number):
+        self.burned = [b for b in self.burned if b[2] > frame_number]
+        return any(((x - bx) ** 2 + (y - by) ** 2) ** 0.5 < STATIC_BURN_R_CM
+                   for bx, by, _e in self.burned)
 
 
 def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
-               fps=DEFAULT_TRACK_FPS, frames_on_spot=0):
+               fps=DEFAULT_TRACK_FPS, guard=None, frame_number=0):
     """Choose one ball detection, preferring trajectory continuity.
 
     Works in PITCH COORDINATES (centimetres), never pixels. An earlier version
@@ -417,33 +532,36 @@ def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
     conf = ball_detections.confidence
     if len(ball_detections) == 0:
         return ball_detections, ball_pitch
-    if conf is None:
-        return ball_detections[0:1], ball_pitch[0:1]
-    if last_pitch is None:
-        best = int(np.argmax(conf))
-        return ball_detections[best:best + 1], ball_pitch[best:best + 1]
 
     # Reachable radius in centimetres, growing with the blank gap so a
     # genuinely lost ball is re-acquired instead of suppressed forever.
     radius_cm = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)) * 100.0
 
-    # Si la pelota ya lleva demasiados frames seguidos sobre una marca de penal,
-    # dejo de aceptar candidatos ahi: cruzarla es normal, quedarse no.
-    veto_spot = frames_on_spot >= PENALTY_MAX_FRAMES_ON_SPOT
-
-    reachable = []
+    ok = []
     for i, (x, y) in enumerate(ball_pitch):
-        dist = ((x - last_pitch[0]) ** 2 + (y - last_pitch[1]) ** 2) ** 0.5
-        if dist > radius_cm:
+        # Fuera del campo: descarte DURO. Una botella en la banda no es la
+        # pelota por mucha confianza que tenga el detector.
+        if _ball_offpitch(x, y):
             continue
-        if veto_spot and on_penalty_spot(x, y):
-            continue
-        reachable.append((float(conf[i]), -dist, i))
+        if last_pitch is None:
+            dist = 0.0
+        else:
+            dist = ((x - last_pitch[0]) ** 2 + (y - last_pitch[1]) ** 2) ** 0.5
+            if dist > radius_cm:
+                continue
+        # Quemado = perdio contra cualquier candidato limpio, pero sigue
+        # elegible si es el unico. Por eso va como primera clave de orden y no
+        # como un ``continue``: asi una pelota realmente quieta (tiro libre,
+        # corner, saque de arco) se conserva, y un objeto quieto solo gana
+        # cuando no hay nada mas -- que es justo cuando da igual.
+        limpio = 0 if (guard and guard.is_burned(x, y, frame_number)) else 1
+        c = float(conf[i]) if conf is not None else 1.0
+        ok.append((limpio, c, -dist, i))
 
-    if not reachable:
+    if not ok:
         return ball_detections[0:0], ball_pitch[0:0]
 
-    best = max(reachable)[2]
+    best = max(ok)[3]
     return ball_detections[best:best + 1], ball_pitch[best:best + 1]
 
 
@@ -453,7 +571,7 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    goalkeeper_class_id=None,
                    transformer=None, last_ball_pitch=None, frames_since_ball=1,
                    ball_crop_result=None, crop_offset=(0, 0),
-                   frames_on_spot=0,
+                   guard=None, frame_number=0,
                    effective_fps=DEFAULT_TRACK_FPS):
     import supervision as sv
 
@@ -569,7 +687,7 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
     ball_detections, ball_pitch = _pick_ball(
         ball_detections, ball_pitch_all,
         last_ball_pitch, frames_since_ball, fps=effective_fps,
-        frames_on_spot=frames_on_spot)
+        guard=guard, frame_number=frame_number)
 
     players_detections.data["pitch_xy"] = players_pitch
     ball_detections.data["pitch_xy"] = ball_pitch
@@ -818,8 +936,11 @@ def track(video_path, output_dir,
     last_ball_pitch, frames_since_ball = None, 1
     # Posicion y velocidad de la pelota en PIXELES, para centrar el recorte.
     last_ball_px, ball_vel_px = None, (0.0, 0.0)
-    frames_on_spot = 0   # frames seguidos con la pelota sobre una marca de penal
+    static_guard = StaticGuard()   # rompe enganches a objetos inmoviles
+    n_released = 0
     transformer = None  # most recent image->pitch homography
+    last_homog_err = 1e9        # error de reproyeccion de la transformacion vigente
+    n_homog_ok = n_homog_rejected = n_homog_jumps = 0
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     annotated_video_path = os.path.join(output_dir, video_name + "_tracked.mp4")
@@ -863,9 +984,33 @@ def track(video_path, output_dir,
         # keypoints to solve a new one).
         if pitch_model is not None and (frame_number - 1) % homography_every == 0:
             pitch_result = pitch_model(frame, imgsz=min(pitch_imgsz, imgsz), verbose=False)[0]
-            new_transformer = build_pitch_transformer(pitch_result, min_conf=pitch_conf)
-            if new_transformer is not None:
-                transformer = new_transformer
+            built = build_pitch_transformer(pitch_result, min_conf=pitch_conf,
+                                            frame_w=frame_w, frame_h=frame_h)
+            if built is None:
+                n_homog_rejected += 1
+            else:
+                new_transformer, new_err, kp = built
+                accept = True
+                if transformer is not None:
+                    # CONTINUIDAD: se proyectan los MISMOS pixeles con la
+                    # transformacion vieja y la nueva. Si el mundo se corre
+                    # varios metros de un refresco al otro, una de las dos esta
+                    # rota; se conserva la vieja salvo que la nueva reproyecte
+                    # claramente mejor (asi se puede salir de una mala, en vez
+                    # de quedar clavado en ella para siempre).
+                    try:
+                        old_xy = transformer.transform_points(points=kp)
+                        jump = float(np.median(
+                            np.linalg.norm(old_xy - new_transformer.transform_points(points=kp),
+                                           axis=1)))
+                    except Exception:
+                        jump = 0.0
+                    if jump > MAX_HOMOGRAPHY_JUMP_CM and new_err >= last_homog_err * 0.5:
+                        accept = False
+                        n_homog_jumps += 1
+                if accept:
+                    transformer, last_homog_err = new_transformer, max(new_err, 1.0)
+                    n_homog_ok += 1
 
         all_detections, ball_detections, ball_cands = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
@@ -875,7 +1020,7 @@ def track(video_path, output_dir,
             last_ball_pitch=last_ball_pitch, frames_since_ball=frames_since_ball,
             effective_fps=effective_fps,
             ball_crop_result=ball_crop_result, crop_offset=crop_offset,
-            frames_on_spot=frames_on_spot)
+            guard=static_guard, frame_number=frame_number)
 
         for cand in ball_cands:
             ball_candidates.append((frame_number,) + cand)
@@ -897,9 +1042,16 @@ def track(video_path, output_dir,
 
         if ball_detections.xyxy.shape[0]:
             b = ball_detections
-            last_ball_pitch = (ball_pitch_xys[0][0], ball_pitch_xys[0][1])
-            frames_on_spot = (frames_on_spot + 1
-                              if on_penalty_spot(*last_ball_pitch) else 0)
+            nueva = (ball_pitch_xys[0][0], ball_pitch_xys[0][1])
+            # Si la pelota lleva demasiados frames sin moverse, se suelta el
+            # ancla: sin esto el enganche a la marca de penal es permanente
+            # (la marca esta a distancia 0 y siempre gana el filtro de
+            # continuidad, la pelota real siempre queda "inalcanzable").
+            if static_guard.update(nueva, last_ball_pitch, frame_number):
+                last_ball_pitch = None
+                n_released += 1
+            else:
+                last_ball_pitch = nueva
             _bb = b.xyxy[0]
             px = ((_bb[0] + _bb[2]) / 2.0, (_bb[1] + _bb[3]) / 2.0)
             if last_ball_px is not None:
@@ -928,6 +1080,15 @@ def track(video_path, output_dir,
 
     if sink:
         sink.__exit__(None, None, None)
+
+    if n_released:
+        print(f"Enganches a objeto quieto rotos: {n_released} "
+              f"({len(static_guard.burned)} posiciones quemadas activas al final)")
+    total_h = n_homog_ok + n_homog_rejected + n_homog_jumps
+    if total_h:
+        print(f"Homografia: {n_homog_ok} aceptadas, {n_homog_rejected} descartadas "
+              f"por calidad, {n_homog_jumps} descartadas por salto "
+              f"({100.0 * (n_homog_rejected + n_homog_jumps) / total_h:.1f}% rechazo)")
 
     # Drop fragmented (ultra-short) player tracks before events.
     players, dropped = drop_short_tracks(players, min_track_frames)
