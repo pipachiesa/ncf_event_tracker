@@ -143,6 +143,28 @@ MIN_KEYPOINT_ASPECT = 0.08   # razon entre los dos ejes principales
 # pantalla.
 MIN_KEYPOINT_PITCH_X_CM = 3000.0   # 30 m de los 120 de largo
 MIN_KEYPOINT_PITCH_Y_CM = 1500.0   # 15 m de los 70 de ancho
+
+# --- ACUMULACION TEMPORAL DE KEYPOINTS ---
+# MEDIDO con el barrido de umbral: bajar `pitch-conf` de 0,5 a 0,1 NO agrega
+# cancha. En 3 de 4 frames muestreados el span se queda en 20,1 m aunque entren
+# mas keypoints: la camara simplemente no muestra mas campo que ese. En cambio
+# el frame 1, que alcanza a ver el circulo central, llega a 49 m con 36 cm de
+# error de reproyeccion.
+#
+# O sea: la informacion para anclar la homografia EXISTE, pero esta repartida en
+# el TIEMPO, no disponible en un frame solo. La camara panea y va mostrando
+# distintas partes de la cancha.
+#
+# Solucion: guardar los keypoints de los ultimos refrescos y arrastrarlos hasta
+# el frame actual compensando el movimiento de camara (estimado con el
+# desplazamiento mediano de los JUGADORES en pantalla, que ya tenemos trackeados
+# -- se mueven cada uno para su lado, asi que la mediana es el movimiento comun,
+# o sea la camara). Con eso se resuelve desde un conjunto que cubre mucha mas
+# cancha que cualquier frame individual.
+#
+# La ventana es corta a proposito: la compensacion es solo traslacion, asi que
+# el error se acumula. 15 refrescos = 75 frames = 5 s.
+KEYPOINT_BUFFER_REFRESHES = 15
 # Guarda ANTI-CATASTROFE, no control de continuidad. Ver la advertencia:
 #
 # ⚠️ UNA VERSION ANTERIOR PUSO ESTO EN 250 cm Y ROMPIO TODO. Comparaba a donde
@@ -238,8 +260,12 @@ DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed 
 #      sintoma SIN CAMBIO -- lo que rompio el caso.
 # LA CAUSA ERA LA HOMOGRAFIA, no la pelota: la marca no estaba quieta en
 # coordenadas de cancha porque la cancha se movia debajo de ella (ver
-# MIN_HOMOGRAPHY_POINTS). Con la homografia arreglada, la pelota a <4 m de una
-# marca de penal paso de 5,20% a 0,00% SIN ningun veto.
+# MIN_HOMOGRAPHY_POINTS). OJO: llegue a escribir aca que "con la homografia
+# arreglada la pelota a <4 m de una marca de penal paso de 5,20% a 0,00%". Ese
+# 0,00% NO prueba nada: el radio de 4 m es una metrica ciega, los falsos
+# positivos caen a 6-14 m de la marca nominal. La metrica que sirve es la
+# fraccion de frames con la pelota DENTRO del area de penal (58,6% medido
+# contra 19,6% esperado). Ver CLAUDE.md.
 # El `StaticGuard` (soltar el ancla de continuidad tras N frames quieto) se
 # implemento y se MIDIO sobre el clip ya arreglado: no aporta nada al sintoma
 # (0,00% con y sin el) y ADEMAS mete teletransportes, porque al soltar el ancla
@@ -338,20 +364,11 @@ def resolve_pitch_model_path(spec):
         return None
 
 
-def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
-                            min_points=MIN_HOMOGRAPHY_POINTS,
-                            frame_w=None, frame_h=None):
-    """Build an image->pitch ``ViewTransformer`` from detected pitch keypoints.
-
-    Devuelve ``(transformer, error_reproyeccion_cm, keypoints)`` o ``None`` si
-    la solucion no pasa los controles de calidad (pocos puntos, puntos
-    degenerados o error de reproyeccion alto), en cuyo caso el llamador reusa
-    la ultima transformacion buena.
-    """
+def extract_keypoints(pitch_result, min_conf=DEFAULT_PITCH_CONF):
+    """Keypoints confiables de un frame: ``(img_pts, pitch_pts)`` o None."""
     import supervision as sv
     try:
         from sports.configs.soccer import SoccerPitchConfiguration
-        from sports.common.view import ViewTransformer
     except Exception:
         return None
 
@@ -360,15 +377,29 @@ def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
         return None
     conf = key_points.confidence[0]
     mask = conf > min_conf
-    if int(mask.sum()) < min_points:
+    if int(mask.sum()) < 4:
+        return None
+    return (key_points.xy[0][mask].astype(np.float32),
+            np.array(SoccerPitchConfiguration().vertices)[mask].astype(np.float32))
+
+
+def solve_homography(frame_pts, pitch_pts, frame_w=None, frame_h=None,
+                     min_points=MIN_HOMOGRAPHY_POINTS):
+    """``(transformer, error_cm)`` o None si no pasa los controles de calidad.
+
+    Los controles son ABSOLUTOS (no comparan contra la transformacion anterior):
+    cantidad de puntos, spread en imagen, spread EN CANCHA y error de
+    reproyeccion. Comparar contra la anterior fue un error caro -- congelaba el
+    mapa, ver MAX_HOMOGRAPHY_JUMP_CM.
+    """
+    try:
+        from sports.common.view import ViewTransformer
+    except Exception:
+        return None
+    if len(frame_pts) < min_points:
         return None
 
-    frame_pts = key_points.xy[0][mask].astype(np.float32)
-    pitch_pts = np.array(SoccerPitchConfiguration().vertices)[mask].astype(np.float32)
-
-    # Configuracion degenerada: puntos amontonados o casi alineados. Resuelven
-    # una homografia exacta cerca de ellos y absurda lejos, y como el balon y
-    # los jugadores suelen estar lejos, el disparate cae justo donde importa.
+    # Degenerada en IMAGEN: puntos amontonados o casi alineados.
     span = frame_pts.max(axis=0) - frame_pts.min(axis=0)
     if frame_w and frame_h:
         if (span[0] < MIN_KEYPOINT_SPREAD * frame_w or
@@ -382,9 +413,10 @@ def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
     except np.linalg.LinAlgError:
         return None
 
-    # Spread EN LA CANCHA. Sin esto se aceptan soluciones ancladas a un solo
-    # rincon del campo (tipicamente un area de penal), que ajustan perfecto ahi
-    # y proyectan a cientos de metros en el resto de la imagen.
+    # Degenerada en CANCHA: anclada a un solo rincon del campo. Ajusta perfecto
+    # ahi y proyecta a cientos de metros en el resto de la imagen. MEDIDO: con
+    # solo el area de penal izquierda (span 20 m) las esquinas de la imagen
+    # proyectaban a (-17768, -14706) cm.
     pspan = pitch_pts.max(axis=0) - pitch_pts.min(axis=0)
     if (pspan[0] < MIN_KEYPOINT_PITCH_X_CM or
             pspan[1] < MIN_KEYPOINT_PITCH_Y_CM):
@@ -392,20 +424,66 @@ def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
 
     try:
         transformer = ViewTransformer(source=frame_pts, target=pitch_pts)
-    except Exception:
-        return None
-
-    # Error de reproyeccion: con >= 6 puntos sobra informacion, asi que se
-    # puede medir si la solucion es buena en vez de asumirlo. Con 4 puntos esto
-    # daria 0 siempre y no diria nada.
-    try:
         back = transformer.transform_points(points=frame_pts)
     except Exception:
         return None
     err = float(np.median(np.linalg.norm(back - pitch_pts, axis=1)))
     if not np.isfinite(err) or err > MAX_REPROJECTION_CM:
         return None
-    return transformer, err, frame_pts
+    return transformer, err
+
+
+class KeypointBuffer:
+    """Keypoints de los ultimos refrescos, arrastrados al frame actual.
+
+    Cada entrada guarda las posiciones en IMAGEN y su vertice de cancha. En
+    cada refresco se corren todas las posiciones de imagen por el movimiento de
+    camara medido, asi siguen siendo validas en el frame de hoy.
+    """
+
+    def __init__(self, max_refreshes=KEYPOINT_BUFFER_REFRESHES):
+        self.max_refreshes = max_refreshes
+        self.entries = []      # [(img_pts (N,2), pitch_pts (N,2))]
+
+    def advance(self, dx, dy):
+        """Compensa el paneo: corre todo lo guardado al frame actual."""
+        if dx or dy:
+            for img, _p in self.entries:
+                img += (dx, dy)
+
+    def add(self, img_pts, pitch_pts):
+        self.entries.append((np.array(img_pts, dtype=float),
+                             np.array(pitch_pts, dtype=float)))
+        if len(self.entries) > self.max_refreshes:
+            self.entries.pop(0)
+
+    def collect(self):
+        """Todas las correspondencias, la mas reciente primero."""
+        if not self.entries:
+            return None, None
+        img = np.vstack([e[0] for e in reversed(self.entries)])
+        pitch = np.vstack([e[1] for e in reversed(self.entries)])
+        return img.astype(np.float32), pitch.astype(np.float32)
+
+    def pitch_span(self):
+        _i, p = self.collect()
+        if p is None:
+            return 0.0, 0.0
+        return (p[:, 0].max() - p[:, 0].min(), p[:, 1].max() - p[:, 1].min())
+
+
+def median_image_shift(prev_by_id, now_by_id, min_common=5):
+    """Movimiento COMUN de los jugadores en pantalla = movimiento de camara.
+
+    Cada jugador se mueve para su lado, asi que la mediana cancela el
+    movimiento propio y deja el de la camara. Devuelve (dx, dy) o (0, 0).
+    """
+    common = prev_by_id.keys() & now_by_id.keys()
+    if len(common) < min_common:
+        return 0.0, 0.0
+    dx = np.median([now_by_id[k][0] - prev_by_id[k][0] for k in common])
+    dy = np.median([now_by_id[k][1] - prev_by_id[k][1] for k in common])
+    return float(dx), float(dy)
 
 
 def _canonical_image_points(frame_w, frame_h):
@@ -965,6 +1043,9 @@ def track(video_path, output_dir,
     n_homog_ok = n_homog_rejected = n_homog_jumps = 0
     canon_img = _canonical_image_points(frame_w, frame_h)
     smooth_pitch = None         # estado del promedio movil de la homografia
+    kp_buffer = KeypointBuffer()
+    last_players_img = {}       # id -> centro en pantalla, frame actual
+    players_at_refresh = {}     # idem, congelado en el ultimo refresco
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     annotated_video_path = os.path.join(output_dir, video_name + "_tracked.mp4")
@@ -1003,39 +1084,44 @@ def track(video_path, output_dir,
                                               verbose=False)[0]
                 crop_offset = (x0, y0)
 
-        # Refresh the homography every ``homography_every`` frames; reuse the
-        # last good transform in between (and keep it if a frame has too few
-        # keypoints to solve a new one).
+        # Refresh de la homografia cada ``homography_every`` frames. Los
+        # keypoints de un frame solo NO alcanzan (cubren ~20 m de cancha), asi
+        # que se acumulan los de los ultimos refrescos arrastrandolos con el
+        # movimiento de camara. Ver KEYPOINT_BUFFER_REFRESHES.
         if pitch_model is not None and (frame_number - 1) % homography_every == 0:
+            dx, dy = median_image_shift(players_at_refresh, last_players_img)
+            kp_buffer.advance(dx, dy)
+            players_at_refresh = dict(last_players_img)
+
             pitch_result = pitch_model(frame, imgsz=min(pitch_imgsz, imgsz), verbose=False)[0]
-            built = build_pitch_transformer(pitch_result, min_conf=pitch_conf,
-                                            frame_w=frame_w, frame_h=frame_h)
+            kps = extract_keypoints(pitch_result, min_conf=pitch_conf)
+            if kps is not None:
+                kp_buffer.add(*kps)
+
+            img_pts, pitch_pts = kp_buffer.collect()
+            built = (solve_homography(img_pts, pitch_pts, frame_w, frame_h)
+                     if img_pts is not None else None)
             if built is None:
                 n_homog_rejected += 1
             else:
-                new_transformer, new_err, kp = built
+                new_transformer, new_err = built
+                # Guarda ANTI-CATASTROFE. Deliberadamente flojo: una version
+                # anterior la uso como control de continuidad y congelo el mapa
+                # (19 aceptadas de 540), lo que arruino la calibracion mientras
+                # sacaba nota perfecta en el test de estabilidad.
                 accept = True
                 if transformer is not None:
-                    # CONTINUIDAD: se proyectan los MISMOS pixeles con la
-                    # transformacion vieja y la nueva. Si el mundo se corre
-                    # varios metros de un refresco al otro, una de las dos esta
-                    # rota; se conserva la vieja salvo que la nueva reproyecte
-                    # claramente mejor (asi se puede salir de una mala, en vez
-                    # de quedar clavado en ella para siempre).
                     try:
-                        old_xy = transformer.transform_points(points=kp)
-                        jump = float(np.median(
-                            np.linalg.norm(old_xy - new_transformer.transform_points(points=kp),
-                                           axis=1)))
+                        probe = canon_img
+                        jump = float(np.median(np.linalg.norm(
+                            transformer.transform_points(points=probe) -
+                            new_transformer.transform_points(points=probe), axis=1)))
                     except Exception:
                         jump = 0.0
                     if jump > MAX_HOMOGRAPHY_JUMP_CM and new_err >= last_homog_err * 0.5:
                         accept = False
                         n_homog_jumps += 1
                 if accept:
-                    # Suavizado temporal: corta el ruido de alta frecuencia de
-                    # los keypoints SIN congelar el mapa (que es lo que arruinó
-                    # la calibración en la version anterior).
                     sm, smooth_pitch = smooth_transformer(
                         new_transformer, canon_img, smooth_pitch)
                     transformer = sm if sm is not None else new_transformer
@@ -1055,6 +1141,12 @@ def track(video_path, output_dir,
             ball_candidates.append((frame_number,) + cand)
 
         object_ids = all_detections.tracker_id
+        # Centro en pantalla de cada jugador: sirve para medir el movimiento de
+        # camara entre refrescos (la mediana cancela el movimiento propio).
+        last_players_img = {
+            str(object_ids[i]): ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+            for i, b in enumerate(all_detections.xyxy)
+        }
         team_ids = all_detections.class_id
         pitch_xys = all_detections.data["pitch_xy"]
         ball_pitch_xys = ball_detections.data["pitch_xy"]
@@ -1103,6 +1195,10 @@ def track(video_path, output_dir,
 
     total_h = n_homog_ok + n_homog_rejected + n_homog_jumps
     if total_h:
+        sx, sy = kp_buffer.pitch_span()
+        print(f"Keypoints acumulados al final: {sum(len(e[0]) for e in kp_buffer.entries)} "
+              f"puntos cubriendo {sx/100:.0f} x {sy/100:.0f} m de cancha "
+              f"(un frame solo cubre ~20 x 55 m)")
         print(f"Homografia: {n_homog_ok} aceptadas, {n_homog_rejected} descartadas "
               f"por calidad, {n_homog_jumps} descartadas por salto "
               f"({100.0 * (n_homog_rejected + n_homog_jumps) / total_h:.1f}% rechazo)")
