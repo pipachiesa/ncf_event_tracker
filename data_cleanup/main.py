@@ -147,6 +147,25 @@ MIN_KEYPOINT_ASPECT = 0.08   # razon entre los dos ejes principales
 # Este umbral queda solo para descartar soluciones absurdas (decenas de metros),
 # que ya deberian caer antes por spread y error de reproyeccion.
 MAX_HOMOGRAPHY_JUMP_CM = 1500.0
+
+# --- SUAVIZADO TEMPORAL DE LA HOMOGRAFIA ---
+# MEDIDO: los filtros de calidad (6 puntos, spread, error de reproyeccion) NO
+# alcanzan -- frames con salto > 1 m 9,12% -> 8,71%, casi nada. El temblor es
+# inherente a re-estimar la transformacion desde cero en cada refresco: los
+# keypoints tienen un par de pixeles de ruido y cerca del horizonte eso son
+# metros de cancha. Rechazar soluciones tampoco sirve (congela el mapa y arruina
+# la calibracion, ver MAX_HOMOGRAPHY_JUMP_CM).
+#
+# La cámara se mueve de forma CONTINUA, asi que la transformacion correcta varia
+# suave y el ruido es de alta frecuencia: un promedio movil lo corta sin
+# congelar nada. En vez de promediar matrices (numericamente feo) se promedian
+# las POSICIONES DE CANCHA a las que proyectan cuatro puntos fijos de la imagen,
+# y se reconstruye la transformacion desde ahi.
+#
+# Con alpha 0.35 la ventana efectiva son ~6 refrescos = 30 frames = 2 s. El
+# paneo medido es de 0,25 px/frame, o sea ~7 px de retraso: despreciable frente
+# a los metros de ruido que elimina.
+HOMOGRAPHY_SMOOTH_ALPHA = 0.35
 # Recompute the homography every N frames (the camera pans smoothly, so we reuse
 # the last transform in between to avoid a keypoint pass on every frame).
 DEFAULT_HOMOGRAPHY_EVERY = 5
@@ -366,6 +385,42 @@ def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
     if not np.isfinite(err) or err > MAX_REPROJECTION_CM:
         return None
     return transformer, err, frame_pts
+
+
+def _canonical_image_points(frame_w, frame_h):
+    """Cuatro puntos fijos de la imagen, repartidos sobre la zona de juego.
+
+    Sirven de "sonda": se mira a que parte de la cancha proyectan y se suaviza
+    ESO. Se evitan los bordes porque cerca del horizonte la homografia es mal
+    condicionada y amplifica cualquier ruido.
+    """
+    import numpy as np
+    return np.array([
+        [0.15 * frame_w, 0.35 * frame_h],
+        [0.85 * frame_w, 0.35 * frame_h],
+        [0.85 * frame_w, 0.90 * frame_h],
+        [0.15 * frame_w, 0.90 * frame_h],
+    ], dtype=np.float32)
+
+
+def smooth_transformer(new_transformer, canon_img, prev_pitch,
+                       alpha=HOMOGRAPHY_SMOOTH_ALPHA):
+    """Promedio movil de la transformacion. Devuelve ``(transformer, pitch)``.
+
+    ``prev_pitch`` es el estado suavizado anterior (o None la primera vez).
+    """
+    from sports.common.view import ViewTransformer
+
+    new_pitch = new_transformer.transform_points(points=canon_img)
+    if not np.all(np.isfinite(new_pitch)):
+        return None, prev_pitch
+    pitch = new_pitch if prev_pitch is None else \
+        alpha * new_pitch + (1.0 - alpha) * prev_pitch
+    try:
+        return (ViewTransformer(source=canon_img,
+                                target=pitch.astype(np.float32)), pitch)
+    except Exception:
+        return None, prev_pitch
 
 
 def anchors_to_pitch(detections, transformer):
@@ -887,6 +942,8 @@ def track(video_path, output_dir,
     transformer = None  # most recent image->pitch homography
     last_homog_err = 1e9        # error de reproyeccion de la transformacion vigente
     n_homog_ok = n_homog_rejected = n_homog_jumps = 0
+    canon_img = _canonical_image_points(frame_w, frame_h)
+    smooth_pitch = None         # estado del promedio movil de la homografia
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     annotated_video_path = os.path.join(output_dir, video_name + "_tracked.mp4")
@@ -955,7 +1012,13 @@ def track(video_path, output_dir,
                         accept = False
                         n_homog_jumps += 1
                 if accept:
-                    transformer, last_homog_err = new_transformer, max(new_err, 1.0)
+                    # Suavizado temporal: corta el ruido de alta frecuencia de
+                    # los keypoints SIN congelar el mapa (que es lo que arruinó
+                    # la calibración en la version anterior).
+                    sm, smooth_pitch = smooth_transformer(
+                        new_transformer, canon_img, smooth_pitch)
+                    transformer = sm if sm is not None else new_transformer
+                    last_homog_err = max(new_err, 1.0)
                     n_homog_ok += 1
 
         all_detections, ball_detections, ball_cands = get_detections(
