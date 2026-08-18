@@ -130,6 +130,19 @@ MAX_REPROJECTION_CM = 300.0
 # los contiene cubra algo de la imagen y que no esten casi alineados.
 MIN_KEYPOINT_SPREAD = 0.15   # fraccion del ancho/alto de imagen
 MIN_KEYPOINT_ASPECT = 0.08   # razon entre los dos ejes principales
+# ⚠️ Los dos de arriba miden el spread EN LA IMAGEN, y eso NO alcanza.
+# MEDIDO con check_pitch_keypoints.py: en 3 de 4 frames muestreados los unicos
+# keypoints confiables eran los indices 0,1,2,6,7,8,9,10,11,12 -- TODOS del area
+# de penal izquierda, o sea x ∈ {0, 550, 1100, 2015} cm: un cluster de 20 m
+# sobre una cancha de 120. En la IMAGEN ocupaban de x=126 a x=888 px, asi que
+# pasaban el filtro sin problema. El error de reproyeccion daba 36-93 cm
+# (excelente) porque el ajuste es bueno CERCA de esos puntos; despues extrapola
+# al resto de la pantalla y se va a cientos de metros: las esquinas de la imagen
+# proyectaban a (-17768,-14706) y (2584, 62716) cm.
+# La homografia hay que anclarla a puntos repartidos por la CANCHA, no por la
+# pantalla.
+MIN_KEYPOINT_PITCH_X_CM = 3000.0   # 30 m de los 120 de largo
+MIN_KEYPOINT_PITCH_Y_CM = 1500.0   # 15 m de los 70 de ancho
 # Guarda ANTI-CATASTROFE, no control de continuidad. Ver la advertencia:
 #
 # ⚠️ UNA VERSION ANTERIOR PUSO ESTO EN 250 cm Y ROMPIO TODO. Comparaba a donde
@@ -367,6 +380,14 @@ def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
         if sing[0] <= 0 or sing[-1] / sing[0] < MIN_KEYPOINT_ASPECT:
             return None
     except np.linalg.LinAlgError:
+        return None
+
+    # Spread EN LA CANCHA. Sin esto se aceptan soluciones ancladas a un solo
+    # rincon del campo (tipicamente un area de penal), que ajustan perfecto ahi
+    # y proyectan a cientos de metros en el resto de la imagen.
+    pspan = pitch_pts.max(axis=0) - pitch_pts.min(axis=0)
+    if (pspan[0] < MIN_KEYPOINT_PITCH_X_CM or
+            pspan[1] < MIN_KEYPOINT_PITCH_Y_CM):
         return None
 
     try:

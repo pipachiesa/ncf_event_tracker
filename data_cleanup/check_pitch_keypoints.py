@@ -94,10 +94,36 @@ def main():
             print(f"\n=== frame {fno}: sin keypoints ===")
             continue
         conf = kp.confidence[0]
+        print(f"\n=== frame {fno} ===")
+
+        # Barrido de umbral: lo que importa no es CUANTOS keypoints entran sino
+        # cuanta CANCHA cubren. Un cluster de 20 m ajusta perfecto localmente y
+        # extrapola a cientos de metros en el resto de la imagen.
+        print(f"  {'umbral':>7} {'kps':>4} {'span x (m)':>11} {'span y (m)':>11} "
+              f"{'reproy (cm)':>12}")
+        for thr in (0.5, 0.4, 0.3, 0.2, 0.1):
+            m = conf > thr
+            k = int(m.sum())
+            if k < 4:
+                print(f"  {thr:>7.1f} {k:>4}   (insuficientes)")
+                continue
+            s = kp.xy[0][m].astype(np.float32)
+            d = verts[m].astype(np.float32)
+            sx = (d[:, 0].max() - d[:, 0].min()) / 100.0
+            sy = (d[:, 1].max() - d[:, 1].min()) / 100.0
+            try:
+                tt = ViewTransformer(source=s, target=d)
+                e = float(np.median(np.linalg.norm(
+                    tt.transform_points(points=s) - d, axis=1)))
+                es = f"{e:>12.0f}"
+            except Exception:
+                es = f"{'no resuelve':>12}"
+            flag = "" if (sx >= 30 and sy >= 15) else "   <- muy poca cancha"
+            print(f"  {thr:>7.1f} {k:>4} {sx:>11.1f} {sy:>11.1f} {es}{flag}")
+
         mask = conf > args.pitch_conf
         idx = np.where(mask)[0]
-        print(f"\n=== frame {fno} ===")
-        print(f"  keypoints con conf > {args.pitch_conf}: {len(idx)} de {len(conf)}")
+        print(f"\n  detalle con umbral {args.pitch_conf}: {len(idx)} de {len(conf)}")
         print(f"  indices usados: {list(idx)}")
         if len(idx) < 4:
             print("  insuficientes para resolver")
