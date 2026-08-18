@@ -45,6 +45,36 @@ def read_fps(tracking, default=15.0):
     return default
 
 
+PITCH_L_CM, PITCH_W_CM = 12000.0, 7000.0
+
+
+def calibration(path):
+    """Chequeo ABSOLUTO: ¿el mapa apunta a la cancha correcta?
+
+    La estabilidad no alcanza. Un mapa CONGELADO no salta nunca y saca nota
+    perfecta en el test de estabilidad mientras pone al arquero a 39 m de su
+    arco. Esto mira si las posiciones tienen sentido en terminos absolutos:
+    sobre unos minutos de juego los jugadores tienen que repartirse por casi
+    toda la cancha y casi nunca salirse de los limites.
+    """
+    xs, ys, off = [], [], 0
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if r["Object"] == "ball":
+                continue
+            try:
+                x, y = float(r["X_Pitch"]), float(r["Y_Pitch"])
+            except (TypeError, ValueError):
+                continue
+            if x == 0 and y == 0:
+                continue
+            xs.append(x)
+            ys.append(y)
+            if not (0 <= x <= PITCH_L_CM and 0 <= y <= PITCH_W_CM):
+                off += 1
+    return xs, ys, off
+
+
 def analyse(path):
     frames = defaultdict(dict)
     with open(path) as fh:
@@ -114,6 +144,38 @@ def main():
                   f"(cada {args.every}); al azar seria {100.0/args.every:.1f}%")
             if frac > 2 * 100.0 / args.every:
                 print("    -> LA CAUSA ES LA HOMOGRAFIA, no el tracking.")
+
+        # --- CALIBRACION (independiente de la estabilidad) ---
+        xs, ys, off = calibration(path)
+        if xs:
+            xs.sort()
+            ys.sort()
+            m = len(xs)
+
+            def qq(v, p):
+                return v[int(p * (len(v) - 1))] / 100.0
+
+            print("  CALIBRACION (que el mapa apunte a la cancha correcta)")
+            print(f"    x: p01 {qq(xs,.01):6.1f}  p50 {qq(xs,.50):6.1f}  "
+                  f"p99 {qq(xs,.99):6.1f} m   (cancha 0-120)")
+            print(f"    y: p01 {qq(ys,.01):6.1f}  p50 {qq(ys,.50):6.1f}  "
+                  f"p99 {qq(ys,.99):6.1f} m   (cancha 0-70)")
+            print(f"    detecciones fuera de los limites: {100.0*off/m:.1f}%")
+            malo = []
+            if qq(xs, .01) > 10:
+                malo.append(f"nadie aparece nunca en los primeros "
+                            f"{qq(xs,.01):.0f} m")
+            if qq(xs, .99) < 110:
+                malo.append(f"nadie pasa nunca de {qq(xs,.99):.0f} m")
+            if qq(ys, .01) < -2 or qq(ys, .99) > 72:
+                malo.append("hay jugadores fuera del campo a lo ancho")
+            if 100.0 * off / m > 5:
+                malo.append(f"{100.0*off/m:.0f}% de detecciones fuera")
+            if malo:
+                print("    -> MAL CALIBRADA: " + "; ".join(malo))
+                print("       (con el arquero en cámara, x deberia llegar a ~0)")
+            else:
+                print("    -> calibracion plausible")
 
 
 if __name__ == "__main__":
