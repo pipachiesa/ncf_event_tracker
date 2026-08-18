@@ -46,6 +46,43 @@ def read_fps(tracking, default=15.0):
 
 
 PITCH_L_CM, PITCH_W_CM = 12000.0, 7000.0
+# Area de penal segun SoccerPitchConfiguration (la misma que usa main.py).
+PBOX_L_CM, PBOX_W_CM = 2015.0, 4100.0
+PBOX_Y0 = (PITCH_W_CM - PBOX_W_CM) / 2.0     # 1450
+PBOX_Y1 = (PITCH_W_CM + PBOX_W_CM) / 2.0     # 5550
+# Fraccion de la superficie que ocupan las DOS areas: el valor esperado si la
+# pelota se repartiera por la cancha. Sale 19,6%.
+PBOX_AREA_FRAC = 2 * PBOX_L_CM * PBOX_W_CM / (PITCH_L_CM * PITCH_W_CM)
+
+
+def ball_in_penalty_box(path):
+    """LA METRICA DEL SINTOMA que reporto Felipe.
+
+    Con la homografia mal calibrada, los falsos positivos de pelota (la marca
+    de penal, puntos blancos de afuera) se amontonan en las areas: medido
+    58,6% de los frames con pelota, contra 19,6% esperado por superficie, o sea
+    3x sobre-representada.
+
+    Ojo con las metricas de radio alrededor de la MARCA de penal: dan 0,00% de
+    forma sistematica porque los enganches caen a 6-14 m de la marca nominal.
+    Hay que medir el area entera, no un circulito.
+    """
+    total = inside = 0
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if r["Object"] != "ball":
+                continue
+            try:
+                x, y = float(r["X_Pitch"]), float(r["Y_Pitch"])
+            except (TypeError, ValueError):
+                continue
+            if x == 0 and y == 0:
+                continue
+            total += 1
+            if PBOX_Y0 <= y <= PBOX_Y1 and (x <= PBOX_L_CM
+                                            or x >= PITCH_L_CM - PBOX_L_CM):
+                inside += 1
+    return total, inside
 
 
 def calibration(path):
@@ -176,6 +213,19 @@ def main():
                 print("       (con el arquero en cámara, x deberia llegar a ~0)")
             else:
                 print("    -> calibracion plausible")
+
+        # --- METRICA DEL SINTOMA: pelota amontonada en las areas ---
+        nball, inbox = ball_in_penalty_box(path)
+        if nball:
+            frac = 100.0 * inbox / nball
+            esperado = 100.0 * PBOX_AREA_FRAC
+            print(f"  PELOTA DENTRO DE UN AREA DE PENAL "
+                  f"({nball} frames con pelota)")
+            print(f"    {frac:.1f}%  (esperado por superficie {esperado:.1f}%, "
+                  f"x{frac/esperado:.1f})")
+            if frac > 2 * esperado:
+                print("    -> SINTOMA PRESENTE: la pelota se engancha en las "
+                      "areas (marca de penal / puntos blancos).")
 
 
 if __name__ == "__main__":

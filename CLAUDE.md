@@ -115,12 +115,13 @@ sobre-representada**. Todas mis métricas anteriores (radio de 4 m alrededor de
 la marca) eran ciegas, porque los falsos positivos caen a 6-14 m de la marca
 nominal. Usar ésta.
 
-⚠️ **Esta métrica NO está implementada en ningún script del repo**: se midió a
-mano sobre el CSV. `check_homography.py` mide estabilidad y calibración, no
-esto. Para el paso 3 hay que escribirla — contar frames con pelota cuyo
-`(x, y)` de cancha caiga en `x < 2015 o x > 9985`, con
-`1450 < y < 5550` — y conviene dejarla adentro de `check_homography.py` para
-que no se vuelva a perder.
+Está implementada en `check_homography.py` (bloque `PELOTA DENTRO DE UN AREA DE
+PENAL`), y reproduce el 58,6% exacto sobre la corrida del 18-ago 09:44.
+
+⚠️ **Sólo se lee si la calibración es plausible.** Sobre la corrida con el mapa
+congelado da **6,1%**, que parece buenísimo y no significa nada: con todo
+corrido 35 m a la derecha, el área izquierda cae en coordenadas donde no hay
+nada. Mirar siempre el bloque CALIBRACION primero.
 
 ---
 
@@ -354,6 +355,19 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 - No commitear `tracking.csv` (173 MB) ni `spain-france-eval.zip` (66 MB).
 - En Downloads conviven varias versiones del mismo CSV (`(1)`, `(2)`, `(3)`).
   Usar `ls -t ... | head -1`, y confirmar con `check_homography.py` cuál es cuál.
+  Identificadas al 18-ago (todas del clip de 3 min, todas con `--ball-crop`):
+
+  | archivo | saltos >1 m | `x: p01` | pelota en área | qué es |
+  |---|---|---|---|---|
+  | `spain-france-test3min_crop.csv` (12-ago) | 9,12% | −6,3 | 53,4% | antes de los filtros de calidad |
+  | `..._crop (1).csv` y `spain-france-test3min.csv` (17-ago) | 0,33% | 34,8 | 6,1% | **mapa CONGELADO** (números falsos) |
+  | `..._crop (2).csv` (18-ago 09:16) | 8,71% | 4,2 | 52,6% | destrabado |
+  | `..._crop (3).csv` (18-ago 09:44) | 7,04% | 4,6 | **58,6%** | destrabado + suavizado ← **la última buena** |
+
+- ⚠️ `~/football_data/matches/clip-test/tracking.csv` (y sus derivados `_vit`,
+  `_clean`, `_interp`) son la corrida del **mapa congelado**, o sea están
+  viejos. Todo lo que se corra sobre ellos mide la configuración equivocada.
+  Reemplazarlos con el re-track nuevo antes de seguir la cadena.
 
 ---
 
@@ -361,10 +375,19 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 
 1. Re-trackear el clip de 3 min con la acumulación de keypoints. Mirar
    `Keypoints acumulados: N puntos cubriendo XX x YY m`. **Objetivo: 60-100 m.**
-2. `check_homography.py` → el bloque CALIBRACIÓN debe decir "plausible", con
-   `x: p01` cerca de 0 y `x: p99` cerca de 120.
-3. Volver a medir **pelota dentro del área** (hoy 58,6%, esperado 19,6%). Ésta es
-   la métrica del síntoma de Felipe.
+2. `check_homography.py` sobre el CSV nuevo. Baseline a batir, de la última
+   corrida buena (`..._crop (3).csv`, 18-ago 09:44):
+
+   | | hoy | objetivo |
+   |---|---|---|
+   | `x: p01` (arquero en cámara) | 4,6 m | ~0 |
+   | `x: p99` | 102,4 m | ~120 |
+   | detecciones fuera de los límites | 11% | <5% |
+   | saltos >1 m | 7,04% | menos |
+   | **pelota dentro del área** | **58,6%** | **~19,7%** |
+
+   El bloque CALIBRACION tiene que pasar de "MAL CALIBRADA" a "plausible".
+3. La métrica del síntoma es la última fila: es la que traduce lo que Felipe ve.
 4. Recién ahí: partido completo (~2,5 h), cadena de limpieza completa, y
    **re-entrenar sobre las etiquetas que ya existen** (están ancladas a frames y
    el video no cambió, no hay que re-etiquetar).
