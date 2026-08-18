@@ -63,10 +63,36 @@ vez del objetivo.** Por eso `check_homography.py` ahora mide las dos cosas por
 separado: ESTABILIDAD (que no salte) y CALIBRACIÓN (que apunte a la cancha
 correcta, vía el rango de posiciones de los jugadores).
 
-Arreglo: `MAX_HOMOGRAPHY_JUMP_CM` 250 → 1500, o sea guarda anti-catástrofe en
-vez de control de continuidad. El trabajo lo hacen los filtros ABSOLUTOS (6+
-puntos, spread, error de reproyección), que no congelan nada. **Pendiente de
-re-trackear y validar.**
+Arreglo, en dos pasos, **ambos validados re-trackeando el clip**:
+
+1. `MAX_HOMOGRAPHY_JUMP_CM` 250 → 1500 (guarda anti-catástrofe, no control de
+   continuidad). Destrabó la calibración: `x: p01` 34,8 → **4,2 m**. Pero volvió
+   el temblor (8,71%), y quedó claro que **los filtros de calidad no sirven
+   contra el temblor**: 9,12% → 8,71%, casi nada. Todo el efecto que parecía
+   venir de ellos era el congelamiento.
+2. **Suavizado temporal** (`HOMOGRAPHY_SMOOTH_ALPHA = 0.35`): promedio móvil
+   sobre las posiciones de cancha a las que proyectan cuatro puntos fijos de la
+   imagen, y se reconstruye la transformación desde ahí (promediar matrices es
+   numéricamente feo). La cámara se mueve continuo, así que el ruido es de alta
+   frecuencia y el promedio lo corta sin congelar.
+
+| | congelado | destrabado | + suavizado |
+|---|---|---|---|
+| saltos >1 m | 0,33%* | 8,71% | **7,04%** |
+| saltos >5 m | 0%* | 1,41% | **0,26%** |
+| p99 | 55 cm* | 630 cm | **265 cm** |
+| `x: p01` | 34,8 m | 4,2 m | 4,6 m |
+| pelota fuera de cancha | — | 5,1% | **0,8%** |
+
+\* números falsos: salían de tener el mapa congelado.
+
+⚠️ **LO QUE SIGUE SIN ARREGLARSE (la queja original de Felipe):** la pelota
+aparece dentro de un área de penal el **58,6%** del tiempo, cuando las dos áreas
+son el **19,6%** de la superficie — 3x sobre-representada. Ésta es la primera
+métrica que captura el síntoma; las anteriores (radio de 4 m alrededor de la
+marca) eran ciegas porque el falso positivo cae a 6-14 m de la marca nominal.
+No se puede atacar hasta cerrar la calibración: si el mapa está corrido, "el
+área" en estas coordenadas no es el área real.
 
 Si tras eso sigue mal calibrada, la otra sospecha es el emparejamiento
 keypoint↔vértice: `build_pitch_transformer` hace `pitch_pts = vertices[mask]`,

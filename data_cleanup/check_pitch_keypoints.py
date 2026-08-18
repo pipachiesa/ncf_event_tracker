@@ -69,8 +69,11 @@ def main():
     print(f"  rango x {verts[:,0].min():.0f}-{verts[:,0].max():.0f} cm, "
           f"y {verts[:,1].min():.0f}-{verts[:,1].max():.0f} cm\n")
 
-    path = M.resolve_model_path(M.DEFAULT_PITCH_MODEL, None) \
-        if hasattr(M, "resolve_model_path") else M.DEFAULT_PITCH_MODEL
+    # El resolver del modelo de KEYPOINTS es distinto del de jugadores/pelota:
+    # 'football-field' se baja de otro repo del Hub.
+    path = M.resolve_pitch_model_path(M.DEFAULT_PITCH_MODEL)
+    if path is None:
+        sys.exit("no pude resolver el modelo de keypoints de cancha")
     model = YOLO(path)
 
     cap = cv2.VideoCapture(os.path.expanduser(args.video))
