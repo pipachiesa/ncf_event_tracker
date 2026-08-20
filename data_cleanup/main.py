@@ -328,8 +328,9 @@ COCO_SPORTS_BALL = 32
 
 # Standard pitch dimensions (centimetres) used to scale normalised image-space
 # coordinates. Matches the dimensions assumed by ``lib.pitch`` for "raw" data.
-PITCH_LENGTH_CM = 12000.0
-PITCH_WIDTH_CM = 7000.0
+# Ver data_cleanup/pitch_config.py: la config de ``sports`` no describe una
+# cancha reglamentaria (area de penal 22% mas profunda, cancha de 120x70).
+from pitch_config import PITCH_L_CM as PITCH_LENGTH_CM, PITCH_W_CM as PITCH_WIDTH_CM
 
 # On frames with few/poor pitch keypoints the homography extrapolates wildly and
 # sends detections far off the pitch. These margins (fractions of pitch size)
@@ -481,9 +482,8 @@ class KeypointBuffer:
 
     def _vertices(self):
         if self._verts is None:
-            from sports.configs.soccer import SoccerPitchConfiguration
-            self._verts = np.array(SoccerPitchConfiguration().vertices,
-                                   dtype=np.float32)
+            from pitch_config import PITCH
+            self._verts = np.array(PITCH.vertices, dtype=np.float32)
         return self._verts
 
     def shift_from_keypoints(self, idx, img_pts, min_common=4):

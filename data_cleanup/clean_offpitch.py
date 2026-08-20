@@ -26,7 +26,8 @@ import argparse
 import csv
 import os
 
-PITCH_L_CM, PITCH_W_CM = 12000.0, 7000.0
+# Cancha reglamentaria; ver data_cleanup/pitch_config.py.
+PITCH_L_CM, PITCH_W_CM = 10500.0, 6800.0
 
 # Tolerancia (fraccion del ancho/largo) antes de considerar que algo esta
 # realmente afuera. La homografia tiene ruido y un jugador sobre la linea

@@ -43,7 +43,8 @@ import os
 import sys
 from collections import defaultdict
 
-PITCH_L_CM, PITCH_W_CM = 12000.0, 7000.0
+# Cancha reglamentaria; ver data_cleanup/pitch_config.py.
+PITCH_L_CM, PITCH_W_CM = 10500.0, 6800.0
 PITCH_L_M, PITCH_W_M = 105.0, 68.0
 
 MAX_SPEED_MS = 40.0      # por encima: transicion imposible

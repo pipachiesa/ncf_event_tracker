@@ -60,7 +60,8 @@ import math
 import os
 from collections import defaultdict
 
-PITCH_L_CM, PITCH_W_CM = 12000.0, 7000.0
+# Cancha reglamentaria; ver data_cleanup/pitch_config.py.
+PITCH_L_CM, PITCH_W_CM = 10500.0, 6800.0
 
 # Lado de la celda de conteo. A 50 cm una pelota en movimiento la cruza en uno
 # o dos frames, asi que acumular decenas de frames en la misma celda solo le

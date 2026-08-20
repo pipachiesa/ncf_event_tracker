@@ -8,7 +8,7 @@ Tracking data reaches us in two different coordinate spaces:
     format Metrica Sports publishes its sample data in.
   * "raw"     - coordinates are the pitch coordinates produced by the tracking
     pipeline (Roboflow / `sports` SoccerPitchConfiguration). Those are measured
-    in centimetres on a 12000 x 7000 cm pitch.
+    in centimetres on a 10500 x 6800 cm pitch (ver pitch_config.py).
 
 To reason about the game geometrically (which goal is which, when the ball goes
 out of play, how far a pass travelled ...) we convert everything into a single
@@ -22,8 +22,10 @@ PITCH_WIDTH_M = 68.0
 
 # Dimensions of the `sports` SoccerPitchConfiguration used by the raw tracking
 # pipeline (centimetres). Used to normalise "raw" coordinates to [0, 1].
-RAW_PITCH_LENGTH_CM = 12000.0
-RAW_PITCH_WIDTH_CM = 7000.0
+# Ver data_cleanup/pitch_config.py: hasta el 20-ago esto era 12000x7000, la
+# geometria ficticia de ``sports``.
+RAW_PITCH_LENGTH_CM = 10500.0
+RAW_PITCH_WIDTH_CM = 6800.0
 
 # The two goals sit at the centre of each goal line.
 LEFT_GOAL = (0.0, 0.5)

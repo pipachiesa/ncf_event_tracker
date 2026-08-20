@@ -43,13 +43,16 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from pitch_config import PITCH, PITCH_L_CM, PITCH_W_CM
+_PB = float(PITCH.penalty_box_length)
+_Y0 = (PITCH_W_CM - PITCH.penalty_box_width) / 2
 LANDMARKS = [
-    ("arco (linea de gol, centro)", (0, 3500)),
-    ("punto de penal", (1100, 3500)),
-    ("borde del area", (2015, 3500)),
-    ("esquina lejana del area", (2015, 1450)),
-    ("esquina cercana del area", (2015, 5550)),
-    ("centro del circulo central", (6000, 3500)),
+    ("arco (linea de gol, centro)", (0, PITCH_W_CM / 2)),
+    ("punto de penal", (float(PITCH.penalty_spot_distance), PITCH_W_CM / 2)),
+    ("borde del area", (_PB, PITCH_W_CM / 2)),
+    ("esquina lejana del area", (_PB, _Y0)),
+    ("esquina cercana del area", (_PB, PITCH_W_CM - _Y0)),
+    ("centro del circulo central", (PITCH_L_CM / 2, PITCH_W_CM / 2)),
 ]
 DEFAULT_GT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib_gt")
 
@@ -62,7 +65,9 @@ def load_gt(path):
     # quedaban 10-14 px corridos y eso son metros en el campo lejano.
     if "homografia_imagen_a_cancha" in gt:
         H = np.array(gt["homografia_imagen_a_cancha"], dtype=np.float64)
-        return gt, H, float(gt.get("distancia_media_a_la_linea_px", float("nan")))
+        return gt, H, float(gt.get("costo_de_alineacion",
+                                   gt.get("distancia_media_a_la_linea_px",
+                                          float("nan"))))
     src = np.array([p["img"] for p in gt["puntos"]], dtype=np.float32)
     dst = np.array([p["pitch"] for p in gt["puntos"]], dtype=np.float32)
     H, _ = cv2.findHomography(src, dst)
@@ -119,7 +124,8 @@ def main():
                   f"{f'({got[0]/100:.0f},{got[1]/100:.0f})':>14}{err:>8.1f} m")
 
         # Error sobre toda la parte de cancha que se ve en el frame.
-        gx, gy = np.meshgrid(np.linspace(0, 12000, 25), np.linspace(0, 7000, 15))
+        gx, gy = np.meshgrid(np.linspace(0, PITCH_L_CM, 25),
+                             np.linspace(0, PITCH_W_CM, 15))
         P = np.stack([gx.ravel(), gy.ravel()], 1).astype(np.float32)
         img = cv2.perspectiveTransform(P.reshape(-1, 1, 2), Hgi).reshape(-1, 2)
         ok = (np.isfinite(img).all(1) & (img[:, 0] > 0) & (img[:, 0] < 1920)

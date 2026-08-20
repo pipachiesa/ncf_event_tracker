@@ -34,8 +34,18 @@ import numpy as np
 # Cuatro puntos de CANCHA repartidos por la zona que suele verse. Se optimizan
 # sus posiciones en IMAGEN: parametrizar asi es estable, mientras que tocar las
 # 8 entradas de la matriz directamente no lo es.
-CTRL = np.array([[0, 1450], [2015, 5550], [6000, 2585], [6000, 4415]],
-                dtype=np.float32)
+def _ctrl():
+    """Cuatro puntos de cancha repartidos por la zona que suele verse."""
+    from pitch_config import PITCH, PITCH_L_CM, PITCH_W_CM
+    y0 = (PITCH_W_CM - PITCH.penalty_box_width) / 2
+    R = float(PITCH.centre_circle_radius)
+    return np.array([[0, y0],
+                     [float(PITCH.penalty_box_length), PITCH_W_CM - y0],
+                     [PITCH_L_CM / 2, PITCH_W_CM / 2 - R],
+                     [PITCH_L_CM / 2, PITCH_W_CM / 2 + R]], dtype=np.float32)
+
+
+CTRL = _ctrl()
 MAX_DIST_PX = 40.0     # la distancia se trunca: robusto a lineas no detectadas
 
 

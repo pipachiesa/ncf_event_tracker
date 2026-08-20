@@ -77,12 +77,12 @@ def main():
 
     import cv2
     from ultralytics import YOLO
-    from sports.configs.soccer import SoccerPitchConfiguration
+    from pitch_config import PITCH
     from sports.common.view import ViewTransformer
     import supervision as sv
     import main as M
 
-    cfg = SoccerPitchConfiguration()
+    cfg = PITCH
     verts = np.array(cfg.vertices, dtype=np.float32)
 
     path = M.resolve_pitch_model_path(M.DEFAULT_PITCH_MODEL)

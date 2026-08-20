@@ -41,7 +41,7 @@ main.py: definen a cuantos frames equivale ``--tmax`` y que fotograma del video
 corresponde a cada frame del CSV (con ``--frame-stride`` NO son el mismo
 numero). ``--fps`` explicito pisa el sidecar.
 
-Pitch coordinates are centimetres on a 12000x7000 pitch; ``--fps`` (default
+Pitch coordinates are centimetres on a 10500x6800 pitch; ``--fps`` (default
 24) only converts ``--tmax`` seconds to frames. CPU only: OpenCV + numpy.
 """
 
@@ -54,8 +54,9 @@ from collections import Counter, defaultdict
 import cv2
 import numpy as np
 
-PITCH_LENGTH_CM = 12000.0
-PITCH_WIDTH_CM = 7000.0
+# Cancha reglamentaria; ver data_cleanup/pitch_config.py.
+PITCH_LENGTH_CM = 10500.0
+PITCH_WIDTH_CM = 6800.0
 
 DEFAULT_FPS = 24.0
 DEFAULT_TMAX_S = 30.0     # max gap between fragments, seconds

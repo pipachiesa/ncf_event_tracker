@@ -34,7 +34,8 @@ import math
 import os
 from collections import Counter
 
-PITCH_L_CM, PITCH_W_CM = 12000.0, 7000.0
+# Cancha reglamentaria; ver data_cleanup/pitch_config.py.
+PITCH_L_CM, PITCH_W_CM = 10500.0, 6800.0
 PITCH_L_M, PITCH_W_M = 105.0, 68.0
 MAX_REAL_SPEED_MS = 35.0
 
