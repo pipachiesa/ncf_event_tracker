@@ -619,6 +619,60 @@ en un solo campo.
 
 ---
 
+# ✅ CALIBRACIÓN CERRADA (20-ago) — y el síntoma quedó localizado
+
+Re-proyectado el clip entero con el mapa nuevo y la geometría reglamentaria
+(`recalibrate.py` + `smooth_homography.py`, **sin GPU**: el CSV ya trae las
+coordenadas de imagen de cada detección).
+
+| | baseline (3) | congelada (4) | **re-calibrado** |
+|---|---|---|---|
+| saltos >1 m | 7,04% | 0,56%* | **1,14%** |
+| saltos >5 m | 1,41% | 0%* | **0,00%** |
+| `x: p01` (arquero en cámara) | 4,6 | 13,2 | **2,1** |
+| `y` (cancha 0-68) | −10,5 a 76,9 | — | **5,9 a 66,8** |
+| detecciones fuera | 10,5% | 3,4% | **0,8%** |
+| pelota / jugadores en el área | 7,0x | — | **4,2x** |
+
+\* falsos: mapa congelado.
+
+Lo que queda de "MAL CALIBRADA" es `x: p99 = 69 m`, y eso **no es un error**: la
+medición de cobertura mostró que el modelo nunca detecta vértices más allá de
+x=69 m, o sea que la cámara no muestra la mitad lejana en este clip.
+
+### El síntoma, por fin localizado
+
+Con el mapa bien, las detecciones falsas dejan de estar repartidas:
+
+```
+celda (50 cm)      frames    %      bloques de 10 s
+( 11,5 , 35,0)       414   21,7%          11
+( 11,5 , 34,5)       145    7,6%           8
+( -1,0 ,  8,0)       112    5,9%           3
+( -1,5 , 41,0)       100    5,2%           6
+las 5 celdas mas visitadas: 45%   (con el mapa roto: 15% repartido en 250)
+```
+
+**El 21,7% de los frames con pelota caen en UNA celda de 50 cm, y el punto de
+penal está en (11, 34) m.** Sumando las vecinas, ~32% está a menos de 1,5 m de
+la marca. Los otros tres clusters están detrás de la línea de gol (x < 0): las
+botellas y toallas del costado.
+
+Es exactamente lo que Felipe venía diciendo desde el principio, y explica por
+qué fallaron los cuatro vetos: **no fallaban por el veto, fallaban porque el
+mapa movía la marca**. Ahora que no se mueve, un veto geométrico sí puede
+funcionar. Re-medirlo es el próximo paso.
+
+⚠️ Al re-proyectar, dos trampas que costaron una vuelta cada una:
+- las filas con caja `(0,0)-(0,0)` son frames SIN pelota. Proyectarlas convierte
+  "sin pelota" en "pelota a −25 m": el 57% de las posiciones quedaron negativas
+  y los movimientos imposibles saltaron a 26,8%. Hay que conservar el cero.
+- el mapa por frame **salta** si se elige entre las dos formas de registrar sin
+  suavizar: saltos >1 m 14,8% y p99 de 59 m. Suavizando la trayectoria de los
+  cuatro puntos de control (mediana móvil + media móvil) baja a 1,14% y 1,03 m.
+
+---
+
 # La pelota: qué se probó y qué quedó
 
 Selección actual en `_pick_ball`: **gate de continuidad** (radio físico en cm,

@@ -201,17 +201,21 @@ def main():
 
             print("  CALIBRACION (que el mapa apunte a la cancha correcta)")
             print(f"    x: p01 {qq(xs,.01):6.1f}  p50 {qq(xs,.50):6.1f}  "
-                  f"p99 {qq(xs,.99):6.1f} m   (cancha 0-120)")
+                  f"p99 {qq(xs,.99):6.1f} m   (cancha 0-{PITCH_L_CM/100:.0f})")
             print(f"    y: p01 {qq(ys,.01):6.1f}  p50 {qq(ys,.50):6.1f}  "
-                  f"p99 {qq(ys,.99):6.1f} m   (cancha 0-70)")
+                  f"p99 {qq(ys,.99):6.1f} m   (cancha 0-{PITCH_W_CM/100:.0f})")
             print(f"    detecciones fuera de los limites: {100.0*off/m:.1f}%")
             malo = []
             if qq(xs, .01) > 10:
                 malo.append(f"nadie aparece nunca en los primeros "
                             f"{qq(xs,.01):.0f} m")
-            if qq(xs, .99) < 110:
+            # ⚠️ Este criterio supone que el clip recorre la cancha entera. En
+            # el clip de 3 min la camara nunca muestra mas alla de x=69 m
+            # (medido con check_keypoint_coverage), asi que un p99 de 74 puede
+            # ser correcto. Sirve para un partido completo, no para un clip.
+            if qq(xs, .99) < 0.9 * PITCH_L_CM / 100:
                 malo.append(f"nadie pasa nunca de {qq(xs,.99):.0f} m")
-            if qq(ys, .01) < -2 or qq(ys, .99) > 72:
+            if qq(ys, .01) < -2 or qq(ys, .99) > PITCH_W_CM / 100 + 2:
                 malo.append("hay jugadores fuera del campo a lo ancho")
             if 100.0 * off / m > 5:
                 malo.append(f"{100.0*off/m:.0f}% de detecciones fuera")
