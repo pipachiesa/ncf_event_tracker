@@ -22,6 +22,52 @@ ahí, nada río abajo puede evaluarse en serio hasta cerrar eso.
 
 ---
 
+# 🔴 LA GEOMETRÍA DE CANCHA DEL PROYECTO ESTÁ MAL (20-ago)
+
+`SoccerPitchConfiguration`, que usa TODO el pipeline, no describe una cancha
+real:
+
+| | config | reglamento |
+|---|---|---|
+| cancha | 120 x 70 m | **105 x 68** (UEFA lo exige) |
+| área de penal, fondo | **20,15 m** | **16,5 m** (22% de más) |
+| área de penal, ancho | 41,0 m | 40,32 m |
+| área chica | 5,5 x 18,32 | 5,5 x 18,32 ✓ |
+| punto de penal | 11 m | 11 m ✓ |
+| círculo central | 9,15 m | 9,15 m ✓ |
+
+**Verificado contra las líneas pintadas** (ajustando la homografía con cada
+geometría y midiendo la distancia a la línea blanca más cercana, por elemento):
+
+```
+                total  gol izq  media  area chica b  circulo
+config          20,4     3,0     1,2      13,6        8,2
+FIFA 105x68     16,7     0,6     0,5       0,0        3,0
+FIFA en 120x70  22,7     6,9     0,5       0,9       11,4
+```
+
+El área chica pasa de 13,6 a **0,0**: ese elemento era uno de los que yo había
+atribuido a oclusión, y no era oclusión, era geometría equivocada. La tercera
+fila descarta que alcance con corregir sólo el área: hace falta también el
+tamaño de la cancha.
+
+### Qué invalida
+
+- Todas las coordenadas de cancha están en un espacio ficticio: las distancias
+  salen ~14% infladas a lo largo y ~3% a lo ancho.
+- La métrica del síntoma usaba `x < 20,15 m` como "área de penal", que es 22%
+  más profunda que la real: **infla la fracción de pelota en el área**.
+- El punto de penal proyectado se corre ~50 px en el frame 761 respecto de la
+  geometría correcta. Es consistente con lo que reportó Felipe ("el punto de
+  penal no está exacto"), aunque en ese frame la marca no se ve en el césped y
+  no se pudo confirmar a ojo.
+
+⚠️ Esto NO explica el error de los keypoints: re-medido con la geometría FIFA
+sigue en 4-6 m (mediana 5,8 m contra 4,1 m con el config). El modelo está mal
+igual.
+
+---
+
 # 🔴 LA CAUSA RAÍZ (20-ago): EL MODELO DE KEYPOINTS DETECTA MAL
 
 Medido contra el ground truth del frame 761, con los propios keypoints que usa
@@ -92,6 +138,28 @@ parche no restringe el campo lejano**, que es el mismo problema de siempre.
 Falta un **prior de escala**. El candidato natural: los jugadores miden ~1,75 m
 y hay miles de cajas por corrida, así que la altura en píxeles de cada uno es
 una referencia de escala independiente del modelo de cancha y de la cámara.
+
+### ⚠️ El registro SIFT tiene que usar SOLO el césped
+
+Registrar con features de toda la imagen mete la tribuna y los carteles, que
+**no están en el plano del piso**. Si la cámara se traslada aunque sea poco,
+esos puntos se mueven distinto que el césped y RANSAC puede terminar ajustando
+el plano equivocado. MEDIDO (costo de alineación del mapa propagado contra las
+líneas del propio frame):
+
+```
+frame    sin mascara   solo cesped
+  316       19,1          25,6
+ 1291       20,2          21,4
+ 1911       59,1          25,4
+ 2531       57,0          24,9
+ 2686       43,8          31,7
+```
+
+Los frames lejos de la referencia mejoran a la mitad. Los cercanos empeoran un
+poco, porque el césped tiene poca textura (40 inliers contra 552). La receta:
+registrar de las dos formas, quedarse con la que puntúe mejor contra las
+líneas del propio frame, y refinar localmente.
 
 ### Lo que sí funciona (validado el 20-ago)
 
