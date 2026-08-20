@@ -88,6 +88,72 @@ def cost_map(mask):
     return np.minimum(d, MAX_DIST_PX).astype(np.float32)
 
 
+def segments():
+    """Los segmentos del modelo de cancha, para el termino inverso."""
+    from check_pitch_overlay import pitch_lines
+    A, B = [], []
+    for ln in pitch_lines():
+        a = np.array(ln, dtype=np.float32)
+        A.append(a[:-1]); B.append(a[1:])
+    return np.concatenate(A), np.concatenate(B)
+
+
+def unexplained(H, real_pts, segs):
+    """Distancia media de cada linea blanca REAL al segmento proyectado mas cercano.
+
+    ⚠️ SIN ESTE TERMINO EL COSTO ES ENGAÑOSO. Midiendo solo "las lineas
+    proyectadas caen sobre lineas blancas" (la direccion de ida), una solucion
+    que empuja el circulo central FUERA del cuadro no paga nada, y otra que mete
+    la cancha entera en el cuadro hace que cada linea proyectada caiga sobre
+    ALGUNA linea real. MEDIDO en el frame 761: un mapa 63 m equivocado sacaba
+    1,2 px de ida (mejor que los 3,9 del mapa correcto) y 37,5 px de vuelta
+    contra 14,9. La suma es lo que discrimina: 38,7 contra 18,9.
+    """
+    import cv2
+    A, B = segs
+    try:
+        Hi = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return MAX_DIST_PX
+    a = cv2.perspectiveTransform(A.reshape(-1, 1, 2), Hi).reshape(-1, 2)
+    b = cv2.perspectiveTransform(B.reshape(-1, 1, 2), Hi).reshape(-1, 2)
+    ok = (np.isfinite(a).all(1) & np.isfinite(b).all(1)
+          & (np.abs(a).max(1) < 1e4) & (np.abs(b).max(1) < 1e4))
+    a, b = a[ok], b[ok]
+    if len(a) < 5:
+        return MAX_DIST_PX
+    d = b - a
+    L = (d * d).sum(1); L[L < 1e-9] = 1e-9
+    p = real_pts[:, None, :] - a[None, :, :]
+    t = np.clip((p * d[None]).sum(2) / L[None], 0, 1)
+    proj = a[None] + t[..., None] * d[None]
+    dist = np.linalg.norm(real_pts[:, None, :] - proj, axis=2).min(1)
+    return float(np.minimum(dist, MAX_DIST_PX).mean())
+
+
+def horizon_from_players(players, img_w):
+    """Fila del horizonte segun las alturas de los jugadores.
+
+    Para una camara mirando el piso, la altura en pixeles de una persona es
+    proporcional a su distancia al horizonte: ``h_px = (h/H_camara)*(v - v_h)``.
+    Con las cajas de los jugadores (miden ~1,75 m y hay veintipico por frame) se
+    ajusta ``h = a*u + b*v + c`` y el horizonte es donde da cero.
+
+    Es la referencia de ESCALA que le falta al resto: los keypoints estan todos
+    en un parche de 20 m y no restringen el campo lejano, asi que un mapa 63 m
+    equivocado los ajusta dentro de 6 m. MEDIDO en el frame 761: el horizonte de
+    los jugadores da v=-367; el mapa correcto implica -493 (dentro del ruido) y
+    el equivocado +134, o sea DENTRO de la imagen, geometricamente absurdo.
+    """
+    if players is None or len(players) < 8:
+        return None
+    u, v, h = np.asarray(players, dtype=float).T
+    c, *_ = np.linalg.lstsq(np.stack([u, v, np.ones_like(u)], 1), h, rcond=None)
+    if abs(c[1]) < 1e-9:
+        return None
+    return float(-(c[0] * img_w / 2 + c[2]) / c[1])
+
+
 def alignment(H, cost, samples=None):
     """Distancia media, en px, entre las lineas proyectadas y las pintadas."""
     import cv2
