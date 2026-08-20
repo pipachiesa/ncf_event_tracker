@@ -1,0 +1,16 @@
+{
+  "video": "spain-france-test3min.mp4",
+  "csv_frame": 761,
+  "video_frame_0based": 1520,
+  "frame_stride": 2,
+  "como_se_hizo": "Puntos leidos a mano sobre el frame a resolucion completa, con zoom y grilla de pixeles. NO se usa en el pipeline: es solo la REGLA con la que se mide el error de calibracion. El detector de keypoints sigue siendo el que trabaja en produccion, que es lo que permite cambiar de camara.",
+  "residuo_del_ajuste_cm": 50,
+  "puntos": [
+    {"img": [875, 187],  "pitch": [2015, 1450], "que_es": "esquina lejana del area grande"},
+    {"img": [412, 520],  "pitch": [2015, 5550], "que_es": "esquina cercana del area grande"},
+    {"img": [1750, 350], "pitch": [6000, 2585], "que_es": "linea media x circulo central, lado lejano"},
+    {"img": [1742, 543], "pitch": [6000, 4415], "que_es": "linea media x circulo central, lado cercano"},
+    {"img": [218, 272],  "pitch": [0, 3866],    "que_es": "base del poste cercano"},
+    {"img": [322, 250],  "pitch": [0, 3134],    "que_es": "base del poste lejano"}
+  ]
+}

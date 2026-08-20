@@ -264,6 +264,45 @@ las detecciones falsas **es** la medida del error de calibración.
 proxies tuvieron su falso positivo: el mapa congelado sacaba nota perfecta en
 estabilidad; "pelota en el área" dio 6,1% con un mapa roto y 19,7% con otro.
 
+## LA REGLA: error de calibración en metros (20-ago)
+
+`check_calibration_error.py` + `calib_gt/clip-test_f761.json`. Seis puntos del
+frame 761 leídos a mano con zoom (esquinas del área grande, cruces de la línea
+media con el círculo central, bases de los postes). El ajuste cierra con **50 cm
+de residuo**, o sea la regla es ~50x más precisa que lo que mide.
+
+⚠️ **El ground truth NO va al pipeline.** Es sólo la regla. El detector de
+keypoints sigue siendo el que trabaja en producción — que es lo que permite
+cambiar de cámara. Anotar a mano en producción sería justamente lo que no se
+quiere.
+
+Resultado sobre la corrida (5):
+
+```
+landmark                        real      pipeline   error
+arco (linea de gol, centro)    (0,35)       (2,21)   14,1 m
+punto de penal                (11,35)      (20,24)   13,8 m
+centro del circulo central    (60,35)     (102,39)   42,0 m
+
+error sobre la cancha visible: p50 26,9 m   p90 63,9 m
+```
+
+El error **crece con la distancia al área**: 14 m junto al arco, 42 m en el
+círculo central. Es la firma exacta de una homografía ajustada a un parche de
+20 m y extrapolada al resto.
+
+### ⚠️ La corrida "mejorada" está PEOR que el baseline
+
+Medido sobre el mismo frame: baseline (3) da **p50 12,1 m**; la corrida (5), con
+ventana de 60 s y un voto por vértice, da **26,9 m**. O sea que todo lo que
+mejoró en los indicadores indirectos (rechazo 94,6% → 27,6%, detecciones fuera
+10,5% → 4,3%, `y: p99` 76,9 → 68,9) convivió con una calibración que empeoró al
+doble.
+
+Es la misma lección por séptima vez: **los proxies mintieron otra vez**. La
+comparación es sobre UN frame, así que el orden entre las dos corridas no está
+firme; lo que sí está firme es que las dos están rotas por un orden de magnitud.
+
 ## La métrica que SÍ captura el síntoma
 
 **Pelota dentro de un área de penal: 58,6%.** Las dos áreas son el 19,6% de la
@@ -553,6 +592,7 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 
 | Script | Qué mide |
 |---|---|
+| `check_calibration_error.py` | **La regla**: error de calibración EN METROS contra un ground truth anotado a mano. Local, segundos. |
 | `check_pitch_overlay.py` | **El test absoluto**: dibuja la cancha según el mapa sobre el video. Local, sin modelos. Mirar esto ANTES que las métricas agregadas. |
 | `check_homography.py` | ESTABILIDAD (que no salte) **y** CALIBRACIÓN (que apunte bien). Sin ground truth ni video. |
 | `check_pitch_keypoints.py` | Qué keypoints se usan, cuánta cancha cubren, error de reproyección. **Correr en Colab** (necesita los modelos). |
