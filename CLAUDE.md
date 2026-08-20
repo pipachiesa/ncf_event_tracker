@@ -22,7 +22,67 @@ ahí, nada río abajo puede evaluarse en serio hasta cerrar eso.
 
 ---
 
-# 🔴 EL PROBLEMA ABIERTO: CALIBRACIÓN DE LA HOMOGRAFÍA
+# 🔴 LA CAUSA RAÍZ (20-ago): EL MODELO DE KEYPOINTS DETECTA MAL
+
+Medido contra el ground truth del frame 761, con los propios keypoints que usa
+`main.py` y con confianza 0.94-0.99:
+
+```
+ idx conf   detectado   donde deberia   error px   error m
+   0 0.99   (664,134)      (646, 94)         44      10,1
+   2 0.94   (264,235)      (392,207)        131       6,5
+   8 0.97   (398,312)      (496,289)        101       4,5
+  11 0.98   (429,403)      (586,390)        158       5,5
+  12 0.54    (74,548)      (407,514)        335       9,5
+                          error mediano:     87       5,5
+```
+
+**El modelo pone los vértices 5,5 m fuera de donde están.** Ver
+`calib_gt/keypoints_vs_lineas_f761.jpg`: las marcas del ground truth caen sobre
+los cruces de las líneas pintadas (esquina del área, tangencia con la D,
+esquina cercana) y las del modelo caen sobre **pasto vacío**.
+
+No es un problema de índices ni de escalado; se probaron los dos:
+
+| hipótesis | residuo |
+|---|---|
+| permutación de índices | los keypoints no caen sobre NINGÚN vértice, ni el propio ni otro |
+| escala anisótropa (bug de aspecto) | 49 px de mediana — no cierra |
+| homografía completa (otra geometría de cancha) | 11 px, pero son 9 puntos y 8 DOF: sobreajuste |
+
+### Esto invalida el diagnóstico anterior
+
+Todo el trabajo previo asumió que los keypoints eran correctos y que el
+problema era su **cobertura** (un parche de 20 m). La cobertura es real, pero
+es secundaria: **ninguna homografía puede salir bien de landmarks corridos
+5 m**, por más que se acumulen o se pondere mejor.
+
+Y explica el error de reproyección bajo (36-93 cm) que durante semanas se leyó
+como señal de un buen ajuste: con 9 puntos y 8 grados de libertad el ajuste
+casi interpola, así que ese número **nunca midió nada**.
+
+### Lo que sí funciona (validado el 20-ago)
+
+Registrar cada frame contra un frame de referencia con features clásicas
+(SIFT + RANSAC) y componer con UNA homografía buena:
+
+```
+540 de 540 refrescos registrados (100%), inliers p50 176, minimo 133
+```
+
+Con la homografía del ground truth como referencia, el overlay cae sobre las
+líneas pintadas en todo el clip. O sea: **el problema no es propagar el mapa en
+el tiempo, es obtenerlo bien UNA vez.**
+
+Camino propuesto: sacar el mapa de referencia **alineando las líneas
+proyectadas contra las líneas blancas de la imagen** (que están siempre, en
+cualquier cámara), usando el modelo de keypoints sólo como inicialización. Eso
+no necesita anotación manual y generaliza a otra cámara, que es el requisito
+que puso Felipe.
+
+---
+
+# 🔴 EL PROBLEMA ANTERIOR: COBERTURA DE LA HOMOGRAFÍA
 
 ## El síntoma, en las palabras de Felipe
 
