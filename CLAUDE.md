@@ -235,6 +235,35 @@ Dato de la geometría, ya verificado: los diez keypoints del área dan 20,2 m de
 span; **unidos con los seis del círculo central dan 69,2 m**. O sea que un solo
 momento con el centro en cámara alcanza para anclar.
 
+## ✅ EL TEST ABSOLUTO (20-ago): dibujar la cancha sobre el video
+
+`check_pitch_overlay.py` proyecta el modelo de cancha (líneas de gol, áreas,
+círculo central, punto de penal) sobre el frame de video y lo compara con las
+líneas **pintadas**. No es un proxy: si el amarillo cae sobre el blanco, el
+mapa está bien.
+
+No hace falta que el CSV guarde la homografía: cada detección de jugador trae
+su posición en imagen y en cancha, y las dos están ligadas por la
+transformación que usó `main.py`. Con 4+ jugadores se recupera exacta (el
+residuo que imprime tiene que dar ~0 cm). **Corre sobre cualquier tracking ya
+generado, sin GPU ni modelos**, así que sirve para auditar corridas viejas.
+
+**Resultado sobre la corrida (5), la mejor hasta ese momento: el círculo
+central proyectado cae ~15 m a la izquierda del pintado, y el punto de penal
+cae fuera del área.** O sea que la homografía SIGUE MAL, a pesar de que el
+rechazo bajó de 94,6% a 27,6% y de que todos los indicadores indirectos
+mejoraron.
+
+Felipe confirmó mirando los recortes: los falsos positivos de pelota son **el
+punto penal** y a veces botellas/toallas de afuera. Eso cierra el círculo con
+el dato de las 250 celdas: un punto FIJO del mundo mapeando a 250 celdas
+distintas sólo se explica si el mapa se mueve debajo de él. La dispersión de
+las detecciones falsas **es** la medida del error de calibración.
+
+⚠️ **Usar este chequeo antes que cualquier métrica agregada.** Todos los
+proxies tuvieron su falso positivo: el mapa congelado sacaba nota perfecta en
+estabilidad; "pelota en el área" dio 6,1% con un mapa roto y 19,7% con otro.
+
 ## La métrica que SÍ captura el síntoma
 
 **Pelota dentro de un área de penal: 58,6%.** Las dos áreas son el 19,6% de la
@@ -524,6 +553,7 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 
 | Script | Qué mide |
 |---|---|
+| `check_pitch_overlay.py` | **El test absoluto**: dibuja la cancha según el mapa sobre el video. Local, sin modelos. Mirar esto ANTES que las métricas agregadas. |
 | `check_homography.py` | ESTABILIDAD (que no salte) **y** CALIBRACIÓN (que apunte bien). Sin ground truth ni video. |
 | `check_pitch_keypoints.py` | Qué keypoints se usan, cuánta cancha cubren, error de reproyección. **Correr en Colab** (necesita los modelos). |
 | `check_keypoint_coverage.py` | Techo de cobertura de cancha por ventana de tiempo, y mejores frames de referencia. **Colab.** |
