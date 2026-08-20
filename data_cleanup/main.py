@@ -162,9 +162,32 @@ MIN_KEYPOINT_PITCH_Y_CM = 1500.0   # 15 m de los 70 de ancho
 # o sea la camara). Con eso se resuelve desde un conjunto que cubre mucha mas
 # cancha que cualquier frame individual.
 #
-# La ventana es corta a proposito: la compensacion es solo traslacion, asi que
-# el error se acumula. 15 refrescos = 75 frames = 5 s.
-KEYPOINT_BUFFER_REFRESHES = 15
+# ⚠️ LA VENTANA DE 5 s (15 refrescos) NO SIRVIO, y el numero de abajo sale de
+# MEDIR, no de estimar. La primera version uso 15 y dio:
+#
+#   Keypoints acumulados al final: 150 puntos cubriendo 20 x 56 m
+#   Homografia: 29 aceptadas, 486 descartadas por calidad (94.6% rechazo)
+#
+# 150 puntos / 15 refrescos = 10 por refresco: quince copias del MISMO parche.
+# El span se mide sobre coordenadas de CANCHA, que son etiquetas fijas del
+# vertice detectado, asi que solo crece si el modelo ve vertices DISTINTOS. A
+# 1,25 px de paneo por refresco, en 5 s la camara se movio 19 px y ve los
+# mismos diez. El arrastre puede estar perfecto y no cambia nada.
+#
+# MEDIDO con check_keypoint_coverage.py sobre el clip (techo por ventana, o sea
+# la union de vertices detectados, independiente de la compensacion del paneo):
+#
+#   ventana    span x p50   % de ventanas >= 30 m
+#     5 s         20,1 m           22%
+#    15 s         20,1 m           35%
+#    30 s         50,8 m           59%
+#    60 s         50,8 m           84%
+#   120 s         50,8 m          100%
+#   clip entero   69,2 m
+#
+# 60 s es donde la ventana empieza a servir de verdad. El clip entero llega a
+# 69,2 m con 17 vertices distintos de 32: ese es el techo de este material.
+KEYPOINT_BUFFER_REFRESHES = 180   # 60 s a 3 refrescos por segundo
 # Guarda ANTI-CATASTROFE, no control de continuidad. Ver la advertencia:
 #
 # ⚠️ UNA VERSION ANTERIOR PUSO ESTO EN 250 cm Y ROMPIO TODO. Comparaba a donde
@@ -365,12 +388,12 @@ def resolve_pitch_model_path(spec):
 
 
 def extract_keypoints(pitch_result, min_conf=DEFAULT_PITCH_CONF):
-    """Keypoints confiables de un frame: ``(img_pts, pitch_pts)`` o None."""
+    """Keypoints confiables de un frame: ``(indices, img_pts)`` o None.
+
+    Devuelve el INDICE del vertice, no su coordenada de cancha, porque el
+    buffer indexa por vertice para no acumular duplicados (ver KeypointBuffer).
+    """
     import supervision as sv
-    try:
-        from sports.configs.soccer import SoccerPitchConfiguration
-    except Exception:
-        return None
 
     key_points = sv.KeyPoints.from_ultralytics(pitch_result)
     if key_points.xy is None or len(key_points.xy) == 0 or key_points.confidence is None:
@@ -379,8 +402,7 @@ def extract_keypoints(pitch_result, min_conf=DEFAULT_PITCH_CONF):
     mask = conf > min_conf
     if int(mask.sum()) < 4:
         return None
-    return (key_points.xy[0][mask].astype(np.float32),
-            np.array(SoccerPitchConfiguration().vertices)[mask].astype(np.float32))
+    return (np.where(mask)[0], key_points.xy[0][mask].astype(np.float32))
 
 
 def solve_homography(frame_pts, pitch_pts, frame_w=None, frame_h=None,
@@ -434,42 +456,95 @@ def solve_homography(frame_pts, pitch_pts, frame_w=None, frame_h=None,
 
 
 class KeypointBuffer:
-    """Keypoints de los ultimos refrescos, arrastrados al frame actual.
+    """Ultima posicion en pantalla conocida de CADA vertice de cancha.
 
-    Cada entrada guarda las posiciones en IMAGEN y su vertice de cancha. En
-    cada refresco se corren todas las posiciones de imagen por el movimiento de
-    camara medido, asi siguen siendo validas en el frame de hoy.
+    ⚠️ INDEXA POR VERTICE, no guarda una lista de observaciones, y la diferencia
+    NO es cosmetica. ``ViewTransformer`` llama a ``cv2.findHomography`` sin
+    metodo robusto, o sea minimos cuadrados sobre TODOS los puntos. Con una
+    ventana de 180 refrescos, los ~9 vertices del area de penal aparecen 180
+    veces cada uno y los del circulo central -- los unicos que aportan cancha --
+    unas pocas. El ajuste quedaria determinado en un 99% por el cluster de 20 m
+    y ``pitch_span`` lo aprobaria igual, porque mide el min/max y no ve que el
+    resto son duplicados. Seria peor que el bug actual: pasaria los controles
+    estando igual de mal. Una entrada por vertice le da a cada uno un voto.
+
+    Cada entrada envejece un refresco por vez y se descarta pasados
+    ``max_age``; cuando el vertice se vuelve a detectar, se reemplaza por la
+    medicion nueva y el arrastre acumulado se borra.
     """
 
-    def __init__(self, max_refreshes=KEYPOINT_BUFFER_REFRESHES):
-        self.max_refreshes = max_refreshes
-        self.entries = []      # [(img_pts (N,2), pitch_pts (N,2))]
+    def __init__(self, max_age=KEYPOINT_BUFFER_REFRESHES):
+        self.max_age = max_age
+        self.seen = {}          # indice de vertice -> [x, y, edad en refrescos]
+        self.drag_errors = []   # px de error de arrastre medidos (ver add)
+        self._verts = None
+
+    def _vertices(self):
+        if self._verts is None:
+            from sports.configs.soccer import SoccerPitchConfiguration
+            self._verts = np.array(SoccerPitchConfiguration().vertices,
+                                   dtype=np.float32)
+        return self._verts
+
+    def shift_from_keypoints(self, idx, img_pts, min_common=4):
+        """Movimiento de camara medido sobre los VERTICES, que estan quietos.
+
+        Mejor estimador que la mediana de los jugadores: un vertice de cancha
+        no se mueve nunca, asi que su desplazamiento en pantalla ES el de la
+        camara. Ademas re-ancla: como se mide contra la posicion guardada, el
+        error de arrastre no se acumula mientras el vertice siga a la vista.
+        Devuelve None si no hay vertices en comun (ahi cae a los jugadores).
+        """
+        d = [np.asarray(img_pts[k], dtype=float) - np.asarray(self.seen[int(i)][:2])
+             for k, i in enumerate(idx) if int(i) in self.seen]
+        if len(d) < min_common:
+            return None
+        d = np.asarray(d)
+        return float(np.median(d[:, 0])), float(np.median(d[:, 1]))
 
     def advance(self, dx, dy):
-        """Compensa el paneo: corre todo lo guardado al frame actual."""
-        if dx or dy:
-            for img, _p in self.entries:
-                img += (dx, dy)
+        """Corre lo guardado al frame actual y envejece las entradas."""
+        for v in self.seen.values():
+            v[0] += dx
+            v[1] += dy
+            v[2] += 1
+        self.seen = {i: v for i, v in self.seen.items() if v[2] <= self.max_age}
 
-    def add(self, img_pts, pitch_pts):
-        self.entries.append((np.array(img_pts, dtype=float),
-                             np.array(pitch_pts, dtype=float)))
-        if len(self.entries) > self.max_refreshes:
-            self.entries.pop(0)
+    def add(self, idx, img_pts, stale_after=5):
+        """Reemplaza con la medicion nueva; de paso MIDE el error de arrastre.
+
+        Si un vertice no se veia hace ``stale_after`` refrescos y reaparece, la
+        distancia entre donde lo arrastramos y donde esta de verdad es el error
+        acumulado de la compensacion. Es la unica forma de saber si la ventana
+        de 60 s se banca el arrastre o hay que acortarla.
+        """
+        for k, i in enumerate(idx):
+            i = int(i)
+            prev = self.seen.get(i)
+            x, y = float(img_pts[k][0]), float(img_pts[k][1])
+            if prev is not None and prev[2] >= stale_after:
+                self.drag_errors.append(float(np.hypot(x - prev[0], y - prev[1])))
+            self.seen[i] = [x, y, 0]
 
     def collect(self):
-        """Todas las correspondencias, la mas reciente primero."""
-        if not self.entries:
+        """``(img_pts, pitch_pts)`` con UNA entrada por vertice."""
+        if not self.seen:
             return None, None
-        img = np.vstack([e[0] for e in reversed(self.entries)])
-        pitch = np.vstack([e[1] for e in reversed(self.entries)])
-        return img.astype(np.float32), pitch.astype(np.float32)
+        idx = sorted(self.seen)
+        img = np.array([self.seen[i][:2] for i in idx], dtype=np.float32)
+        pitch = self._vertices()[idx].astype(np.float32)
+        return img, pitch
 
     def pitch_span(self):
         _i, p = self.collect()
         if p is None:
             return 0.0, 0.0
         return (p[:, 0].max() - p[:, 0].min(), p[:, 1].max() - p[:, 1].min())
+
+    def drag_error_p50(self):
+        if not self.drag_errors:
+            return float("nan")
+        return float(np.median(self.drag_errors))
 
 
 def median_image_shift(prev_by_id, now_by_id, min_common=5):
@@ -1041,6 +1116,7 @@ def track(video_path, output_dir,
     transformer = None  # most recent image->pitch homography
     last_homog_err = 1e9        # error de reproyeccion de la transformacion vigente
     n_homog_ok = n_homog_rejected = n_homog_jumps = 0
+    n_shift_kps = n_shift_players = 0
     canon_img = _canonical_image_points(frame_w, frame_h)
     smooth_pitch = None         # estado del promedio movil de la homografia
     kp_buffer = KeypointBuffer()
@@ -1089,12 +1165,25 @@ def track(video_path, output_dir,
         # que se acumulan los de los ultimos refrescos arrastrandolos con el
         # movimiento de camara. Ver KEYPOINT_BUFFER_REFRESHES.
         if pitch_model is not None and (frame_number - 1) % homography_every == 0:
-            dx, dy = median_image_shift(players_at_refresh, last_players_img)
-            kp_buffer.advance(dx, dy)
-            players_at_refresh = dict(last_players_img)
-
+            # 1. Detectar PRIMERO. Los vertices de cancha son el mejor
+            #    estimador del movimiento de camara: estan quietos, asi que su
+            #    desplazamiento en pantalla es el de la camara y punto. La
+            #    mediana de los jugadores es el plan B (se mueven, y hay que
+            #    confiar en que la mediana cancele el movimiento propio).
             pitch_result = pitch_model(frame, imgsz=min(pitch_imgsz, imgsz), verbose=False)[0]
             kps = extract_keypoints(pitch_result, min_conf=pitch_conf)
+
+            # 2. Compensar el paneo antes de mezclar lo viejo con lo nuevo.
+            shift = kp_buffer.shift_from_keypoints(*kps) if kps is not None else None
+            if shift is None:
+                shift = median_image_shift(players_at_refresh, last_players_img)
+                n_shift_players += 1
+            else:
+                n_shift_kps += 1
+            kp_buffer.advance(*shift)
+            players_at_refresh = dict(last_players_img)
+
+            # 3. Las mediciones de este frame pisan lo arrastrado.
             if kps is not None:
                 kp_buffer.add(*kps)
 
@@ -1196,9 +1285,20 @@ def track(video_path, output_dir,
     total_h = n_homog_ok + n_homog_rejected + n_homog_jumps
     if total_h:
         sx, sy = kp_buffer.pitch_span()
-        print(f"Keypoints acumulados al final: {sum(len(e[0]) for e in kp_buffer.entries)} "
-              f"puntos cubriendo {sx/100:.0f} x {sy/100:.0f} m de cancha "
-              f"(un frame solo cubre ~20 x 55 m)")
+        drag = kp_buffer.drag_error_p50()
+        print(f"Keypoints acumulados al final: {len(kp_buffer.seen)} vertices "
+              f"distintos cubriendo {sx/100:.0f} x {sy/100:.0f} m de cancha "
+              f"(un frame solo cubre ~20 x 55 m; el techo del clip es 69 x 70)")
+        # Si el arrastre acumulado es de decenas de pixeles, la ventana de 60 s
+        # es demasiado larga para una compensacion que solo traslada.
+        n_shift = n_shift_kps + n_shift_players
+        if n_shift:
+            print(f"  paneo estimado con vertices en {100.0*n_shift_kps/n_shift:.0f}% "
+                  f"de los refrescos, con jugadores en el resto")
+        if np.isfinite(drag):
+            print(f"  error de arrastre al re-detectar un vertice viejo: "
+                  f"mediana {drag:.1f} px sobre {len(kp_buffer.drag_errors)} "
+                  f"mediciones (sano < 10 px)")
         print(f"Homografia: {n_homog_ok} aceptadas, {n_homog_rejected} descartadas "
               f"por calidad, {n_homog_jumps} descartadas por salto "
               f"({100.0 * (n_homog_rejected + n_homog_jumps) / total_h:.1f}% rechazo)")

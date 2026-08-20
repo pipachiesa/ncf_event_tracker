@@ -131,6 +131,26 @@ rechazo del cluster de 20 m. **Se corrieron ad hoc y no quedaron versionados**
 los cuatro pasaban y aún así el enfoque no servía: probaban la mecánica, no la
 premisa.
 
+### ⚠️ La corrida del 18-ago 12:39 marcó 19,7% de pelota en el área. NO es un arreglo.
+
+Ese número es exactamente el esperado por superficie (x1,0) y parece el cierre
+del problema. No lo es, y el propio bloque CALIBRACION lo dice:
+
+```
+x: p01 13.2  p50 56.0  p99  91.9 m   (cancha 0-120)
+-> MAL CALIBRADA: nadie aparece nunca en los primeros 13 m; nadie pasa de 92 m
+Homografia: 29 aceptadas, 486 descartadas (94.6% rechazo)   <- mapa congelado
+```
+
+Con 29 mapas en 540 refrescos el clip corre casi congelado, y los jugadores
+ocupan 13-92 m de una cancha de 120. En ese sistema de coordenadas corrido, las
+zonas donde el script busca las áreas no son las áreas. La prueba de que el
+número es arbitrario: **el mismo tipo de mapa congelado dio 6,1% el 17-ago y
+19,7% ahora**. Es ruido de calibración, no señal.
+
+Regla, otra vez: **la métrica del síntoma sólo se lee si CALIBRACION dice
+"plausible"**.
+
 ### La medición que decide qué hacer
 
 `check_keypoint_coverage.py` (Colab, ~1-2 min sobre el clip): para ventanas de
@@ -145,7 +165,66 @@ paneo. Da tres veredictos:
 | "NINGUNA VENTANA RAZONABLE" | frame de referencia + movimiento de cámara de pocos DOF |
 | "NI EL CLIP ENTERO" | el problema es la detección, no la acumulación |
 
-El camino del **frame de referencia**: una homografía son 8 grados de libertad y
+### Resultado de esa medición (18-ago, clip de 3 min)
+
+```
+por muestra:  keypoints p50 9    span x p50 20,1 m    max 50,8 m
+              muestras que solas pasan el minimo (30 x 15 m): 51 de 540 (9,4%)
+vertices distintos en TODO el clip: 17 de 32   (span 69 x 70 m)
+
+ventana     span x p50   % de ventanas >= 30 m
+   5 s         20,1 m           22%
+  15 s         20,1 m           35%
+  30 s         50,8 m           59%
+  60 s         50,8 m           84%
+ 120 s         50,8 m          100%
+ clip entero   69,2 m
+```
+
+**Veredicto: ACUMULAR SIRVE, con ventana de ~60 s (180 refrescos).** El techo de
+este material es 69,2 m: el modelo nunca detecta más de 17 de los 32 vértices.
+Alcanza de sobra — el mínimo exigido son 30 m.
+
+### El segundo arreglo (18-ago 13:10): ventana de 60 s + una entrada por vértice
+
+Subir la ventana a 180 refrescos **no alcanza solo**, y esto es lo que casi
+cuesta otra vuelta: `ViewTransformer` llama a `cv2.findHomography` **sin método
+robusto**, o sea mínimos cuadrados sobre todos los puntos. Con 180 refrescos,
+los ~9 vértices del área aparecen 180 veces cada uno y los del círculo central
+—los únicos que aportan cancha— unas pocas. El ajuste quedaría determinado en
+un 99% por el cluster de 20 m, **y `pitch_span` lo aprobaría igual**, porque
+mira el mín/máx y no ve que el resto son duplicados. Sería peor que el bug
+original: pasaría todos los controles estando igual de mal.
+
+Por eso el `KeypointBuffer` ahora **indexa por vértice**: una entrada por
+vértice, la más reciente, con edad. Cada vértice tiene un voto.
+
+Y el paneo se estima con los **vértices** en vez de con los jugadores: un
+vértice de cancha no se mueve nunca, así que su desplazamiento en pantalla es
+el de la cámara. Además re-ancla, porque se mide contra la posición guardada:
+mientras el vértice siga a la vista, el error de arrastre no se acumula. Los
+jugadores quedan de plan B.
+
+Validado en simulación (cámara paneando con homografía conocida, ruido de 2 px,
+540 refrescos), midiendo el error de calibración sobre TODA la cancha y no sólo
+sobre los puntos del ajuste:
+
+| esquema | rechazadas | error de calibración p50 | p90 |
+|---|---|---|---|
+| una entrada por vértice | 59 | **45 cm** | 53 cm |
+| con duplicados | 30 | 103 cm | 196 cm |
+
+El de duplicados **acepta más y está 2-4x peor**: los duplicados inflan el
+conteo de puntos y le hacen pasar el filtro. Los rechazos del esquema nuevo son
+todos por "pocos puntos" (4-5 vértices), o sea cuando de verdad falta
+información, no por geometría degenerada.
+
+La corrida imprime dos cosas nuevas para verificarlo sobre datos reales: el
+**error de arrastre** (cuánto se corrió un vértice viejo cuando reaparece —
+sano < 10 px) y el porcentaje de refrescos donde el paneo se estimó con
+vértices.
+
+El camino del **frame de referencia**, si esto no alcanza: una homografía son 8 grados de libertad y
 un parche de 20 m no los determina. Pero si se resuelve UNA buena con los frames
 que sí ven mucha cancha (el frame 1 llega a 49 m porque alcanza el círculo
 central), después por refresco alcanza con estimar el movimiento de cámara
@@ -428,10 +507,11 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 
 # Próximos pasos
 
-1. `check_keypoint_coverage.py` sobre el clip (Colab). Decide entre ventana más
-   larga y frame de referencia. **Hacer esto ANTES de tocar `main.py`**: la
-   vuelta anterior se perdió por dimensionar la ventana a ojo.
-2. Implementar el camino que indique el veredicto, y re-trackear el clip.
+1. ~~`check_keypoint_coverage.py`~~ hecho: veredicto "acumular sirve con 60 s".
+2. Re-trackear el clip con `KEYPOINT_BUFFER_REFRESHES = 180` y el buffer
+   indexado por vértice. Mirar, en este orden: el **error de arrastre**
+   (< 10 px), el **rechazo de homografías** (si pasa 80% el mapa está
+   congelado y no hay que leer nada más), y recién ahí la calibración.
 3. `check_homography.py` sobre el CSV nuevo. Baseline a batir, de la última
    corrida buena (`..._crop (3).csv`, 18-ago 09:44):
 
