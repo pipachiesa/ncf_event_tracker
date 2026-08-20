@@ -61,6 +61,38 @@ Y explica el error de reproyección bajo (36-93 cm) que durante semanas se leyó
 como señal de un buen ajuste: con 9 puntos y 8 grados de libertad el ajuste
 casi interpola, así que ese número **nunca midió nada**.
 
+### El refinamiento contra las líneas: funciona, pero sólo LOCAL
+
+`refine_homography.py`. Máscara de líneas blancas (brillante + poco saturado +
+más claro que sus vecinos a ambos lados + dentro del césped) y se optimizan los
+8 DOF para minimizar la distancia entre las líneas proyectadas y las pintadas.
+
+Partiendo del ground truth a mano: **12,7 px → 3,9 px**, moviendo los landmarks
+10-14 px. Esos 10-14 px son los que Felipe vio a ojo ("están alineadas pero un
+poco corridas") y en el campo lejano son metros. La regla de `calib_gt/` ahora
+guarda la matriz refinada, no los puntos a mano.
+
+Partiendo del mapa del pipeline (12-43 m de error): **no lo rescata**
+(27,5 → 24,8 px). Es un refinador local, no un buscador.
+
+### ⚠️ La alineación de líneas NO sirve como criterio global
+
+Se probó buscar el mapa entre los 126 subconjuntos de 4 keypoints, eligiendo
+por alineación. El ganador saca **0,9 px de alineación media y está 63 m mal**.
+
+La razón, mirando el detalle por elemento: la solución falsa mete la cancha
+ENTERA dentro del cuadro — proyecta 18 elementos visibles contra los 11 del
+mapa correcto — así que cada línea proyectada cae sobre *alguna* línea pintada.
+Con líneas paralelas repetidas, un mapa corrido encaja igual de bien.
+
+Tampoco discrimina exigir compatibilidad con los keypoints: como los 9 están en
+un parche de 20 m, un mapa 63 m equivocado los ajusta dentro de 6 m. **El
+parche no restringe el campo lejano**, que es el mismo problema de siempre.
+
+Falta un **prior de escala**. El candidato natural: los jugadores miden ~1,75 m
+y hay miles de cajas por corrida, así que la altura en píxeles de cada uno es
+una referencia de escala independiente del modelo de cancha y de la cámara.
+
 ### Lo que sí funciona (validado el 20-ago)
 
 Registrar cada frame contra un frame de referencia con features clásicas

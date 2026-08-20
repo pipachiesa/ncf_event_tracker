@@ -6,11 +6,90 @@
   "como_se_hizo": "Puntos leidos a mano sobre el frame a resolucion completa, con zoom y grilla de pixeles. NO se usa en el pipeline: es solo la REGLA con la que se mide el error de calibracion. El detector de keypoints sigue siendo el que trabaja en produccion, que es lo que permite cambiar de camara.",
   "residuo_del_ajuste_cm": 50,
   "puntos": [
-    {"img": [875, 187],  "pitch": [2015, 1450], "que_es": "esquina lejana del area grande"},
-    {"img": [412, 520],  "pitch": [2015, 5550], "que_es": "esquina cercana del area grande"},
-    {"img": [1750, 350], "pitch": [6000, 2585], "que_es": "linea media x circulo central, lado lejano"},
-    {"img": [1742, 543], "pitch": [6000, 4415], "que_es": "linea media x circulo central, lado cercano"},
-    {"img": [218, 272],  "pitch": [0, 3866],    "que_es": "base del poste cercano"},
-    {"img": [322, 250],  "pitch": [0, 3134],    "que_es": "base del poste lejano"}
-  ]
+    {
+      "img": [
+        875,
+        187
+      ],
+      "pitch": [
+        2015,
+        1450
+      ],
+      "que_es": "esquina lejana del area grande"
+    },
+    {
+      "img": [
+        412,
+        520
+      ],
+      "pitch": [
+        2015,
+        5550
+      ],
+      "que_es": "esquina cercana del area grande"
+    },
+    {
+      "img": [
+        1750,
+        350
+      ],
+      "pitch": [
+        6000,
+        2585
+      ],
+      "que_es": "linea media x circulo central, lado lejano"
+    },
+    {
+      "img": [
+        1742,
+        543
+      ],
+      "pitch": [
+        6000,
+        4415
+      ],
+      "que_es": "linea media x circulo central, lado cercano"
+    },
+    {
+      "img": [
+        218,
+        272
+      ],
+      "pitch": [
+        0,
+        3866
+      ],
+      "que_es": "base del poste cercano"
+    },
+    {
+      "img": [
+        322,
+        250
+      ],
+      "pitch": [
+        0,
+        3134
+      ],
+      "que_es": "base del poste lejano"
+    }
+  ],
+  "homografia_imagen_a_cancha": [
+    [
+      6.920301321163579,
+      13.720027278131617,
+      -5653.962586336125
+    ],
+    [
+      -1.7887798121991099,
+      27.0060525154387,
+      -1279.4014811702873
+    ],
+    [
+      7.781038181076519e-05,
+      0.0021787831291205434,
+      1.0
+    ]
+  ],
+  "refinamiento": "Los puntos a mano quedaban 10-14 px corridos (Felipe lo vio a ojo). La homografia guardada es el resultado de REFINARLOS alineando las lineas proyectadas contra la mascara de lineas blancas de la imagen: la distancia media a la linea blanca mas cercana bajo de 12,7 px a 3,9 px. Usar esta matriz, no los puntos.",
+  "distancia_media_a_la_linea_px": 3.94
 }

@@ -58,6 +58,11 @@ def load_gt(path):
     import cv2
     with open(path) as fh:
         gt = json.load(fh)
+    # Preferir la matriz REFINADA contra las lineas blancas: los puntos a mano
+    # quedaban 10-14 px corridos y eso son metros en el campo lejano.
+    if "homografia_imagen_a_cancha" in gt:
+        H = np.array(gt["homografia_imagen_a_cancha"], dtype=np.float64)
+        return gt, H, float(gt.get("distancia_media_a_la_linea_px", float("nan")))
     src = np.array([p["img"] for p in gt["puntos"]], dtype=np.float32)
     dst = np.array([p["pitch"] for p in gt["puntos"]], dtype=np.float32)
     H, _ = cv2.findHomography(src, dst)
@@ -89,7 +94,7 @@ def main():
         gt, Hgt, res = load_gt(gt_path)
         frame = int(gt["csv_frame"])
         print(f"\nground truth: {os.path.basename(gt_path)}  frame {frame}  "
-              f"(residuo propio {res:.0f} cm)")
+              f"(distancia media a la linea blanca: {res:.1f} px)")
         if frame not in rows:
             print("  el CSV no tiene detecciones en ese frame")
             continue
