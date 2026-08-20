@@ -45,14 +45,12 @@ def read_fps(tracking, default=15.0):
     return default
 
 
-PITCH_L_CM, PITCH_W_CM = 12000.0, 7000.0
-# Area de penal segun SoccerPitchConfiguration (la misma que usa main.py).
-PBOX_L_CM, PBOX_W_CM = 2015.0, 4100.0
-PBOX_Y0 = (PITCH_W_CM - PBOX_W_CM) / 2.0     # 1450
-PBOX_Y1 = (PITCH_W_CM + PBOX_W_CM) / 2.0     # 5550
-# Fraccion de la superficie que ocupan las DOS areas: el valor esperado si la
-# pelota se repartiera por la cancha. Sale 19,6%.
-PBOX_AREA_FRAC = 2 * PBOX_L_CM * PBOX_W_CM / (PITCH_L_CM * PITCH_W_CM)
+# ⚠️ La geometria vive en pitch_config.py. La que se uso hasta el 20-ago (la
+# de ``sports``) tenia el area de penal 22% mas profunda que la real, asi que
+# ESTA METRICA VENIA INFLADA: contaba como "dentro del area" una franja de
+# 3,65 m que en una cancha de verdad esta afuera.
+from pitch_config import (PITCH_L_CM, PITCH_W_CM, PBOX_L_CM, PBOX_W_CM,
+                          PBOX_AREA_FRAC, in_penalty_box)
 
 
 def ball_in_penalty_box(path):
@@ -84,8 +82,7 @@ def ball_in_penalty_box(path):
                 continue
             if x == 0 and y == 0:
                 continue
-            in_box = (PBOX_Y0 <= y <= PBOX_Y1
-                      and (x <= PBOX_L_CM or x >= PITCH_L_CM - PBOX_L_CM))
+            in_box = in_penalty_box(x, y)
             if r["Object"] == "ball":
                 total += 1
                 inside += in_box

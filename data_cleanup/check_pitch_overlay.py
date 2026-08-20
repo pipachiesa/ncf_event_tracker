@@ -46,12 +46,13 @@ import os
 
 import numpy as np
 
-# Cancha de SoccerPitchConfiguration, en cm.
-L, W = 12000.0, 7000.0
-PBOX_L, PBOX_W = 2015.0, 4100.0
-GBOX_L, GBOX_W = 550.0, 1832.0
-PEN_SPOT = 1100.0
-CIRCLE_R = 915.0
+# La geometria vive en un solo lugar. Ver pitch_config.py: la del paquete
+# ``sports`` que se usaba antes no describe una cancha reglamentaria.
+from pitch_config import PITCH, PITCH_L_CM as L, PITCH_W_CM as W
+PBOX_L, PBOX_W = float(PITCH.penalty_box_length), float(PITCH.penalty_box_width)
+GBOX_L, GBOX_W = float(PITCH.goal_box_length), float(PITCH.goal_box_width)
+PEN_SPOT = float(PITCH.penalty_spot_distance)
+CIRCLE_R = float(PITCH.centre_circle_radius)
 
 
 def _seg(a, b, n=40):
@@ -60,28 +61,13 @@ def _seg(a, b, n=40):
 
 
 def pitch_lines():
-    """Las lineas del modelo, en coordenadas de cancha (cm)."""
-    y0, y1 = (W - PBOX_W) / 2, (W + PBOX_W) / 2
-    g0, g1 = (W - GBOX_W) / 2, (W + GBOX_W) / 2
-    lines = [
-        _seg((0, 0), (0, W)), _seg((L, 0), (L, W)),          # lineas de gol
-        _seg((0, 0), (L, 0)), _seg((0, W), (L, W)),          # laterales
-        _seg((L / 2, 0), (L / 2, W)),                        # linea media
-    ]
-    for x0 in (0.0, L - PBOX_L):                             # areas de penal
-        x1 = x0 + PBOX_L if x0 == 0 else L
-        xf = PBOX_L if x0 == 0 else L - PBOX_L
-        lines += [_seg((x0 if x0 else 0, y0), (xf, y0)),
-                  _seg((xf, y0), (xf, y1)),
-                  _seg((xf, y1), (x0 if x0 else 0, y1))]
-    for x0 in (0.0, L - GBOX_L):                             # areas chicas
-        xf = GBOX_L if x0 == 0 else L - GBOX_L
-        lines += [_seg((x0 if x0 else 0, g0), (xf, g0)),
-                  _seg((xf, g0), (xf, g1)),
-                  _seg((xf, g1), (x0 if x0 else 0, g1))]
-    lines.append([(L / 2 + CIRCLE_R * np.cos(t), W / 2 + CIRCLE_R * np.sin(t))
-                  for t in np.linspace(0, 2 * np.pi, 72)])
-    return lines
+    """Las lineas del modelo, en coordenadas de cancha (cm).
+
+    Incluye las dos "D", que con la geometria vieja eran un punto (tangente al
+    area) y en una cancha real son un arco visible. Es el chequeo mas directo
+    de que la geometria esta bien.
+    """
+    return list(PITCH.polylines().values())
 
 
 def read_frames(path):
