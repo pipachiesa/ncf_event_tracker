@@ -84,7 +84,7 @@ homografía se haya aceptado. Los otros tres (arquero, y negativo, carteles)
 mediciones mías dieron "0,00%" no porque el problema no existiera sino porque el
 mapa estaba corrido.
 
-## El arreglo en curso (implementado, PENDIENTE DE VALIDAR)
+## El arreglo que se probó y NO funcionó (18-ago 12:39)
 
 Acumular keypoints entre refrescos, arrastrándolos con el movimiento de cámara:
 
@@ -97,15 +97,64 @@ Acumular keypoints entre refrescos, arrastrándolos con el movimiento de cámara
 - `solve_homography()` exige spread **en cancha** (`MIN_KEYPOINT_PITCH_X_CM=3000`,
   `MIN_KEYPOINT_PITCH_Y_CM=1500`), no sólo en imagen.
 
-La corrida imprime `Keypoints acumulados al final: N puntos cubriendo XX x YY m`.
-**Si el span llega a 60-100 m funcionó; si sigue en ~20 m, la compensación del
-paneo no está agarrando.**
+### Resultado medido: no sirvió, y dejó el mapa casi congelado
+
+```
+Keypoints acumulados al final: 150 puntos cubriendo 20 x 56 m de cancha
+Homografia: 29 aceptadas, 486 descartadas por calidad, 25 por salto (94.6% rechazo)
+```
+
+150 puntos ÷ 15 refrescos = **10 por refresco**: son los mismos diez keypoints
+del diagnóstico del frame 500, quince veces. El span quedó igual que el de un
+frame solo.
+
+**La razón es geométrica, no un bug.** `pitch_span()` se mide sobre las
+coordenadas de **cancha**, que son etiquetas fijas del vértice detectado (el
+vértice 8 es el vértice 8 siempre). Lo que `advance(dx,dy)` corrige son las
+coordenadas de **imagen**. Entonces el span en cancha crece **sólo si el modelo
+detecta vértices distintos en refrescos distintos**, y a 1,25 px de paneo por
+refresco, en los 5 s de la ventana la cámara se movió ~19 px: ve los mismos
+diez vértices. El arrastre puede estar perfecto y no cambia nada.
+
+Y como 20 m < `MIN_KEYPOINT_PITCH_X_CM` (30 m), `solve_homography` rechazó casi
+todo: **29 mapas aceptados en 540 refrescos**, o sea el mismo modo de falla del
+mapa congelado del 17-ago (96,5%). Esa corrida es PEOR que el baseline del
+18-ago; no usarla.
+
+El error de fondo fue dimensionar la ventana a ojo. El doc decía "la información
+está repartida en el tiempo", que es cierto, pero repartida en **decenas de
+segundos** (el frame 1 y el frame 500 están a 33 s), no en 5.
 
 Tests pasados: arrastre correcto, ventana acotada, estimación de cámara,
 rechazo del cluster de 20 m. **Se corrieron ad hoc y no quedaron versionados**
-(el único test en el repo es `event_generation/test_synthetic.py`), así que no
-se pueden re-correr: si tocás `KeypointBuffer` o `median_image_shift`, hay que
-reescribirlos.
+(el único test en el repo es `event_generation/test_synthetic.py`). Nótese que
+los cuatro pasaban y aún así el enfoque no servía: probaban la mecánica, no la
+premisa.
+
+### La medición que decide qué hacer
+
+`check_keypoint_coverage.py` (Colab, ~1-2 min sobre el clip): para ventanas de
+1 a 120 s calcula la **unión** de vértices detectados y cuánta cancha cubren.
+Como las coordenadas de cancha son absolutas, eso es el **techo** de cualquier
+acumulación con esa ventana, sin importar qué tan bien ande la compensación del
+paneo. Da tres veredictos:
+
+| veredicto | qué hacer |
+|---|---|
+| "ACUMULAR SIRVE con ventana de N s" | subir `KEYPOINT_BUFFER_REFRESHES` y re-trackear |
+| "NINGUNA VENTANA RAZONABLE" | frame de referencia + movimiento de cámara de pocos DOF |
+| "NI EL CLIP ENTERO" | el problema es la detección, no la acumulación |
+
+El camino del **frame de referencia**: una homografía son 8 grados de libertad y
+un parche de 20 m no los determina. Pero si se resuelve UNA buena con los frames
+que sí ven mucha cancha (el frame 1 llega a 49 m porque alcanza el círculo
+central), después por refresco alcanza con estimar el movimiento de cámara
+relativo — 2 a 4 DOF, que un parche de 20 m sí determina. No acumula deriva
+porque cada refresco re-ancla contra keypoints absolutos.
+
+Dato de la geometría, ya verificado: los diez keypoints del área dan 20,2 m de
+span; **unidos con los seis del círculo central dan 69,2 m**. O sea que un solo
+momento con el centro en cámara alcanza para anclar.
 
 ## La métrica que SÍ captura el síntoma
 
@@ -299,7 +348,12 @@ demostró que sirve ahora y antes lo había marcado como nulo.
    `match.py`, `event_generator.py`, `reid.py`, `label_tool.py`. Los frames del
    CSV son consecutivos; el frame de VIDEO es `(k-1)*stride+1`.
 5. **supervision `Detections`** se indexa con SLICE (`[i:i+1]`), nunca escalar.
-6. **No inventar negativos.** Un tracking mejor detecta transiciones nuevas sin
+6. **Una premisa falsa pasa todos los tests unitarios.** El `KeypointBuffer`
+   pasó cuatro tests (arrastre, ventana, estimación de cámara, rechazo del
+   cluster) y no servía para nada: los tests probaban que la mecánica hacía lo
+   que yo quería, no que lo que yo quería sirviera. Antes de implementar,
+   medir el TECHO de lo que el enfoque podría dar si funcionara perfecto.
+7. **No inventar negativos.** Un tracking mejor detecta transiciones nuevas sin
    etiqueta; contarlas como negativas enseña que los pases reales no son pases
    (AUC 0,678→0,593). `train.py --proposals` las descarta.
 
@@ -330,6 +384,7 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 |---|---|
 | `check_homography.py` | ESTABILIDAD (que no salte) **y** CALIBRACIÓN (que apunte bien). Sin ground truth ni video. |
 | `check_pitch_keypoints.py` | Qué keypoints se usan, cuánta cancha cubren, error de reproyección. **Correr en Colab** (necesita los modelos). |
+| `check_keypoint_coverage.py` | Techo de cobertura de cancha por ventana de tiempo, y mejores frames de referencia. **Colab.** |
 | `benchmark.py` | tracking + eventos con las mismas métricas siempre |
 
 ---
@@ -373,9 +428,11 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 
 # Próximos pasos
 
-1. Re-trackear el clip de 3 min con la acumulación de keypoints. Mirar
-   `Keypoints acumulados: N puntos cubriendo XX x YY m`. **Objetivo: 60-100 m.**
-2. `check_homography.py` sobre el CSV nuevo. Baseline a batir, de la última
+1. `check_keypoint_coverage.py` sobre el clip (Colab). Decide entre ventana más
+   larga y frame de referencia. **Hacer esto ANTES de tocar `main.py`**: la
+   vuelta anterior se perdió por dimensionar la ventana a ojo.
+2. Implementar el camino que indique el veredicto, y re-trackear el clip.
+3. `check_homography.py` sobre el CSV nuevo. Baseline a batir, de la última
    corrida buena (`..._crop (3).csv`, 18-ago 09:44):
 
    | | hoy | objetivo |
