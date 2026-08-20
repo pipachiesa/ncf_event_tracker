@@ -328,6 +328,69 @@ alineación incremental no tiene referencia absoluta; sólo los keypoints la tie
 
 ---
 
+## Resultado del segundo arreglo (18-ago 13:40) — el mapa mejoró, el síntoma no
+
+Corrida `..._crop (5).csv`, con ventana de 60 s y un voto por vértice:
+
+| | congelado (4) | baseline (3) | **nueva (5)** |
+|---|---|---|---|
+| rechazo de homografías | 94,6% | — | **27,6%** |
+| saltos >1 m | 0,56%* | 7,04% | **4,23%** |
+| `x: p01` | 13,2 | 4,6 | 6,4 |
+| `x: p99` | 91,9 | 102,4 | 92,1 |
+| `y: p99` (cancha = 70) | — | 76,9 | **68,9** |
+| detecciones fuera | 3,4% | 10,5% | **4,3%** |
+| pelota en el área | 19,7%* | 58,6% | 50,6% → **45,6% con Viterbi** |
+
+\* números falsos: mapa congelado.
+
+**El mapa dejó de estar congelado** (391 mapas aceptados de 540) y mejoró en
+todo lo que se puede verificar sin ground truth. Pero el síntoma sigue.
+
+### La métrica del síntoma, corregida
+
+El 19,7% "esperado por superficie" supone que la pelota se reparte pareja por
+la cancha, y en este clip se juega en un solo campo. La referencia correcta son
+**los jugadores**, que están sujetos a la misma homografía y al mismo partido:
+
+```
+pelota en un area:    45,6%
+jugadores en un area:  7,5%     -> la pelota esta ahi 6,1x mas que ellos
+x mediana de la pelota:   19 m  |  x mediana de los jugadores: 45 m
+```
+
+Esa razón de 6,1x es el síntoma, y **no depende de dónde se haya jugado**. Está
+implementada en `check_homography.py`.
+
+### Dónde se engancha: NO es un punto
+
+Con el mapa ya confiable se puede localizar. Sobre 250 celdas de 2x2 m
+ocupadas, las 5 más visitadas suman apenas el 15%, y las de arriba están sobre
+la **línea de gol y las líneas del área**: `(0,28)`, `(2,34)`, `(4,34)`,
+`(16,32)` m. O sea las marcas blancas, repartidas — exactamente lo que Felipe
+describió, y la razón por la que todos los vetos "sobre la marca de penal"
+fallaron: nunca hubo UNA marca.
+
+⚠️ **Esto reabre el veto de rachas estáticas.** El veto #4 (borrar todas las
+rachas estáticas) no movió la métrica y de ahí salió el diagnóstico de la
+homografía. Pero eso se midió con el mapa roto: las detecciones falsas no
+quedaban quietas porque la cancha se movía debajo. **Ahora sí quedan quietas**:
+medido sobre la corrida nueva, 46% de los frames con pelota están en rachas que
+se mueven <6 px/frame en pantalla, y en cancha derivan 1-2 m en 6-8 s. El veto
+merece re-medirse.
+
+### Sobre "nadie pasa nunca de 92 m"
+
+Ese renglón del bloque CALIBRACION puede ser una **falsa alarma**. La medición
+de cobertura mostró que los 17 vértices que el modelo llega a detectar en todo
+el clip cubren x ∈ [0, 69] m: la cámara nunca muestra la mitad lejana. Todo lo
+que esté más allá de 69 m es extrapolación, y exigir que `x: p99` llegue a 110
+supone que el clip recorre la cancha entera. No está verificado que el juego
+haya pasado de 92 m. El criterio sirve para un partido completo, no para 3 min
+en un solo campo.
+
+---
+
 # La pelota: qué se probó y qué quedó
 
 Selección actual en `_pick_ball`: **gate de continuidad** (radio físico en cm,

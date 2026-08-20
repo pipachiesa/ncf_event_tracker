@@ -66,23 +66,33 @@ def ball_in_penalty_box(path):
     Ojo con las metricas de radio alrededor de la MARCA de penal: dan 0,00% de
     forma sistematica porque los enganches caen a 6-14 m de la marca nominal.
     Hay que medir el area entera, no un circulito.
+
+    Devuelve tambien la fraccion de JUGADORES en las areas, que es la referencia
+    correcta: el 19,7% por superficie supone que la pelota se reparte pareja por
+    la cancha, y en un clip donde se juega en un solo campo eso es falso. La
+    razon pelota/jugadores no depende de donde haya pasado el partido. MEDIDO
+    en el clip: la pelota esta en las areas 6,1x mas que los jugadores, con el
+    juego centrado en x=45 m y la pelota en x=19 m.
     """
     total = inside = 0
+    p_total = p_inside = 0
     with open(path) as fh:
         for r in csv.DictReader(fh):
-            if r["Object"] != "ball":
-                continue
             try:
                 x, y = float(r["X_Pitch"]), float(r["Y_Pitch"])
             except (TypeError, ValueError):
                 continue
             if x == 0 and y == 0:
                 continue
-            total += 1
-            if PBOX_Y0 <= y <= PBOX_Y1 and (x <= PBOX_L_CM
-                                            or x >= PITCH_L_CM - PBOX_L_CM):
-                inside += 1
-    return total, inside
+            in_box = (PBOX_Y0 <= y <= PBOX_Y1
+                      and (x <= PBOX_L_CM or x >= PITCH_L_CM - PBOX_L_CM))
+            if r["Object"] == "ball":
+                total += 1
+                inside += in_box
+            else:
+                p_total += 1
+                p_inside += in_box
+    return total, inside, p_total, p_inside
 
 
 def calibration(path):
@@ -215,7 +225,7 @@ def main():
                 print("    -> calibracion plausible")
 
         # --- METRICA DEL SINTOMA: pelota amontonada en las areas ---
-        nball, inbox = ball_in_penalty_box(path)
+        nball, inbox, nplay, pinbox = ball_in_penalty_box(path)
         if nball:
             frac = 100.0 * inbox / nball
             esperado = 100.0 * PBOX_AREA_FRAC
@@ -223,9 +233,18 @@ def main():
                   f"({nball} frames con pelota)")
             print(f"    {frac:.1f}%  (esperado por superficie {esperado:.1f}%, "
                   f"x{frac/esperado:.1f})")
-            if frac > 2 * esperado:
-                print("    -> SINTOMA PRESENTE: la pelota se engancha en las "
-                      "areas (marca de penal / puntos blancos).")
+            # Referencia robusta: donde estan los jugadores. No depende de en
+            # que parte de la cancha se haya jugado el clip.
+            if nplay:
+                pfrac = 100.0 * pinbox / nplay
+                ratio = frac / pfrac if pfrac else float("inf")
+                print(f"    jugadores en un area: {pfrac:.1f}%  "
+                      f"-> la pelota esta ahi {ratio:.1f}x mas que ellos")
+                if ratio > 2.0:
+                    print("    -> SINTOMA PRESENTE: la pelota se engancha en "
+                          "las areas (lineas y marcas blancas).")
+                    print("       Ojo: no es UN punto. MEDIDO sobre 250 celdas "
+                          "de 2x2 m, las 5 mas visitadas suman 15%.")
 
 
 if __name__ == "__main__":
