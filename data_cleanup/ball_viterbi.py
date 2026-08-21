@@ -105,9 +105,20 @@ def static_penalties(by_frame, cell_m=0.6, min_hits=None, weight=3.0):
 
     n_frames = max(1, len(by_frame))
     if min_hits is None:
-        # Una posicion presente en mas del 2% de los frames del partido no es
+        # Una posicion presente en mas del 5% de los frames del partido no es
         # una pelota en juego: es parte de la cancha.
-        min_hits = max(20, int(0.02 * n_frames))
+        #
+        # ⚠️ El umbral era 2% y da PEOR. MEDIDO sobre el clip re-calibrado
+        # (mapa nuevo, coords 105x68), barriendo el umbral con weight 3:
+        #     umbral   pelota/jug   frames   imposibles   huecos>15f
+        #       2%       2,2x        1080       2,7%          7%
+        #       4%       2,0x        1221       2,2%          4%
+        #       6%       1,9x        1287       2,1%          2%
+        # A 2% penaliza celdas por las que la pelota REAL pasa varias veces
+        # (zonas de juego), y al vetarlas pierde pelota real -> mas huecos.
+        # A 5-6% solo caen la marca de penal (21,7% en una celda de 50 cm) y
+        # los clusters fijos de atras del arco, que es lo que hay que sacar.
+        min_hits = max(20, int(0.05 * n_frames))
 
     pen = {}
     for f, cands in by_frame.items():

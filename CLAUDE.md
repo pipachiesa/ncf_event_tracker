@@ -694,6 +694,53 @@ de ellas. De ahí salió el diagnóstico de la homografía.
 
 `ball_unpin.py` queda en el repo pero está **superado**: atacaba un síntoma.
 
+## ✅ EL VETO YA FUNCIONA — con el mapa arreglado (21-ago)
+
+Los cuatro vetos no fallaban por el veto: fallaban porque el mapa movía la
+marca. Con la calibración cerrada, re-proyectados los candidatos al sistema
+105x68 y re-corrido el Viterbi, la **lista negra de celdas sobre-visitadas**
+(que ya está en `ball_viterbi.static_penalties`) por fin muerde. MEDIDO,
+`pelota / jugadores en el área` (el síntoma que traduce lo que Felipe ve):
+
+| variante | pelota/jug | frames | imposibles | top-5 celdas |
+|---|---|---|---|---|
+| sin veto | 4,4x | 2007 | 1,0% | 64% |
+| lista negra (static) | 2,2x | 1080 | 2,7% | 17% |
+| geométrico sobre la marca | 1,9x | 1577 | 1,4% | — |
+| los dos | 1,9x | 1066 | 2,7% | — |
+
+El **geométrico solo** (vetar <1,5 m de la marca) baja el síntoma pero manda la
+pelota a las botellas de atrás del arco (x mediana −0,8 m): veta la marca y deja
+lo demás. Y **hardcodea la posición de la marca, así que no generaliza** a otra
+cancha. La **lista negra generaliza** (no sabe dónde está nada, mira sólo qué
+posiciones reaparecen) y rompe la concentración de 64% a 17%.
+
+### El umbral de la lista negra: 2% era peor, subido a 5%
+
+Barrido del umbral (fracción de frames por encima de la cual una celda es
+"cancha, no pelota"), con weight 3:
+
+```
+umbral   pelota/jug   frames   imposibles   huecos>15f
+  2%       2,2x        1080       2,7%          7%
+  4%       2,0x        1221       2,2%          4%
+  6%       1,9x        1287       2,1%          2%
+```
+
+Subir el umbral mejora TODO a la vez. A 2% penaliza celdas por las que la pelota
+real pasa varias veces (zonas de juego) y al vetarlas pierde pelota real. A 5-6%
+sólo caen la marca de penal (21,7% en una celda de 50 cm) y los clusters fijos
+de atrás del arco. Cambiado a **5%** en `ball_viterbi.py`.
+
+### ⚠️ El techo lo pone el DETECTOR, no el veto
+
+La lista negra sólo puede BORRAR el enganche, no poner la pelota real donde no
+se detectó. Por eso el síntoma se estanca en ~1,9x (no baja a 1,0x) y quedan
+huecos: en el 78% de los frames enganchados no hay otro candidato cerca de los
+jugadores. Para bajar más hay que mejorar la **detección de la pelota** — el
+ball-crop de alta resolución, que se puede re-evaluar ahora que las coordenadas
+son buenas (el A/B anterior se midió con el mapa roto).
+
 ## `StaticGuard`: implementado y quitado tras medirlo
 
 Soltaba el ancla de continuidad tras N frames quieto. Aislado sobre los
