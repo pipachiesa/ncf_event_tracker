@@ -53,6 +53,28 @@ SPEED_WEIGHT = 0.05      # penalizacion por m/s POR ENCIMA de lo plausible
 PLAUSIBLE_SPEED_MS = 20.0  # hasta aca la pelota se mueve normal: coste cero
 MAX_MISSING_RUN = 90     # frames sin pelota tras los cuales se corta el enlace
 
+# Margen fuera de cancha, ASIMETRICO. Detras de las lineas de gol el margen es
+# chico: ahi se paran las botellas, toallas y carteles, y un candidato fijo a
+# 1-4 m detras del arco NO es la pelota. En los laterales el margen es generoso
+# porque la pelota SI sale por el lateral (lateral, corner) y vuelve.
+#
+# ⚠️ POR QUE IMPORTA, con ground truth de Felipe (10 frames de pelota real que
+# el pipeline perdia): una botella fija detras del arco, por ej (-1, 9) m, pasa
+# el margen viejo (0,04 x 105 = 4,2 m) y el Viterbi la elige como pelota. Ese
+# enganche ANCLA el camino: desde (-1, 9) la pelota real en (69, 38) queda a
+# 70 m = inalcanzable, asi que una trayectoria de juego de 7 frames coherentes
+# se descarta entera. MEDIDO: con el margen de gol bajado a 0,5 m se recuperan
+# 5 de 10 frames de pelota real, sin subir los movimientos imposibles (2,2% ->
+# 2,3%) ni meter falsos. El gate de continuidad NO era el problema (subir
+# MAX_SPEED no cambia nada); el ancla-enganche detras del arco si.
+OFFPITCH_MARGIN_GOAL_M = 0.5     # detras de las lineas de gol
+OFFPITCH_MARGIN_SIDE_M = 2.7     # 0,04 x 68 m, los laterales
+
+
+def _offpitch(x_m, y_m):
+    return (x_m < -OFFPITCH_MARGIN_GOAL_M or x_m > PITCH_L_M + OFFPITCH_MARGIN_GOAL_M
+            or y_m < -OFFPITCH_MARGIN_SIDE_M or y_m > PITCH_W_M + OFFPITCH_MARGIN_SIDE_M)
+
 
 def read_fps(tracking_csv, default=24.0):
     meta = tracking_csv.rsplit(".", 1)[0] + ".meta.json"
@@ -70,12 +92,15 @@ def load_candidates(path):
         for row in csv.DictReader(fh):
             try:
                 f = int(row["Frame"])
+                x_m = float(row["X_Pitch"]) / PITCH_L_CM * PITCH_L_M
+                y_m = float(row["Y_Pitch"]) / PITCH_W_CM * PITCH_W_M
+                if _offpitch(x_m, y_m):
+                    continue          # botella/publicidad detras del arco, etc.
                 by_frame[f].append((
                     float(row["Conf"]),
                     float(row["X1"]), float(row["Y1"]),
                     float(row["X2"]), float(row["Y2"]),
-                    float(row["X_Pitch"]) / PITCH_L_CM * PITCH_L_M,
-                    float(row["Y_Pitch"]) / PITCH_W_CM * PITCH_W_M,
+                    x_m, y_m,
                 ))
             except (KeyError, TypeError, ValueError):
                 continue

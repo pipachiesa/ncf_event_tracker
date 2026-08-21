@@ -16,9 +16,12 @@ técnicas van completas, sin simplificar de más. Habla español (Argentina).
 
 ## Estado en una línea
 
-El pipeline entero corre de punta a punta, pero **las coordenadas de cancha
-están mal calibradas**, y como todas las features del clasificador se calculan
-ahí, nada río abajo puede evaluarse en serio hasta cerrar eso.
+La calibración del **clip de 3 min** está cerrada (mosaico de líneas, 0,3-0,6 m
+de error) y la geometría del proyecto corregida a la reglamentaria. Falta
+calibrar **spain-france completo** (el partido con las 1416 etiquetas), que es
+por tramos y frágil de automatizar; hasta cerrar eso no se puede re-medir el
+AUC del clasificador. El enganche de la pelota (marca de penal + botellas
+detrás del arco) ya está resuelto con el mapa bueno.
 
 ---
 
@@ -757,12 +760,34 @@ sólo detrás / fuera de cancha    7%   <- hueco correcto
 candidato de JUEGO plausible    49%   <- el Viterbi lo rechazó por inalcanzable
 ```
 
-El 49% tenía un candidato dentro de la cancha y lejos de la marca, y el gate de
-continuidad lo descartó por exceder el radio físico desde el ancla. Puede ser
-ruido legítimamente descartado o pelota real perdida — **no se puede saber sin
-ground truth denso de la pelota**, que no existe. Ése es el próximo hilo si se
-quiere subir la presencia, y necesita anotar la pelota frame a frame en un
-tramo, no mejorar el detector.
+El 49% tenía un candidato dentro de la cancha y lejos de la marca. Felipe anotó
+24 de esos huecos (`dataset/ball_gt/clip-test_gate_huecos.json`): **10 eran
+pelota real** (42%). O sea que el pipeline perdía pelota real recuperable.
+
+### ✅ La causa: un enganche DETRÁS del arco ancla el camino (21-ago)
+
+No era el gate de continuidad (subir `MAX_SPEED` no recupera ninguno) ni el
+`MISSING_COST` (recupera 1 de 10 y mete falsos). Diagnosticado sobre los 10
+frames con ground truth: la pelota real tenía una trayectoria de **7 frames
+coherentes** (ej. frame 1291: (69,37)→(68,41)), pero el Viterbi elegía **(−1,9)
+m** —una botella detrás de la línea de gol— en los frames alternos. Desde
+(−1,9) la pelota real a (69,38) está a 70 m = inalcanzable, así que la
+trayectoria de juego entera se descartaba.
+
+La botella pasaba el margen fuera-de-cancha porque era **simétrico y generoso**
+(0,04 × 105 = 4,2 m detrás del arco). Cambiado a un margen **asimétrico**
+(`ball_viterbi._offpitch`): 0,5 m detrás de las líneas de gol, 2,7 m en los
+laterales (donde la pelota sí sale y vuelve). MEDIDO:
+
+```
+margen tras línea de gol   pelota real / 10   imposibles   pelota/jug
+  4,2 m (viejo, simétrico)        1              2,2%          1,8x
+  0,5 m (nuevo)                   5              2,3%          1,9x
+```
+
+Recupera 5 de 10 sin subir los imposibles ni meter falsos. Los otros 5 son
+detecciones aisladas de la pelota lejana (un frame suelto, sin trayectoria):
+ésas sí son el límite del material.
 
 ## `StaticGuard`: implementado y quitado tras medirlo
 
