@@ -732,14 +732,37 @@ real pasa varias veces (zonas de juego) y al vetarlas pierde pelota real. A 5-6%
 sólo caen la marca de penal (21,7% en una celda de 50 cm) y los clusters fijos
 de atrás del arco. Cambiado a **5%** en `ball_viterbi.py`.
 
-### ⚠️ El techo lo pone el DETECTOR, no el veto
+### ⚠️ El ball-crop NO es la solución (re-evaluado 21-ago con el mapa bueno)
 
-La lista negra sólo puede BORRAR el enganche, no poner la pelota real donde no
-se detectó. Por eso el síntoma se estanca en ~1,9x (no baja a 1,0x) y quedan
-huecos: en el 78% de los frames enganchados no hay otro candidato cerca de los
-jugadores. Para bajar más hay que mejorar la **detección de la pelota** — el
-ball-crop de alta resolución, que se puede re-evaluar ahora que las coordenadas
-son buenas (el A/B anterior se midió con el mapa roto).
+La hipótesis era que el crop de alta resolución, que antes bajaba el AUC
+(0,678→0,619), ahora ayudaría porque la lista negra limpia lo que refuerza de
+más. **Medido, falla:** el crop se centra en la predicción (`last_px+vel_px`),
+y cuando la pelota viene enganchada esa predicción apunta a la marca de penal,
+así que el crop **re-detecta la marca en alta resolución** — justo lo que la
+lista negra acaba de sacar. Sobre los huecos del Viterbi: de 9 recuperaciones
+del crop, 7 caen en la marca (11,35) o detrás del arco, sólo 2 en juego real.
+
+Y la marca es **indistinguible de la pelota por apariencia**: confianza 0,31 vs
+0,29, lado de caja 8 vs 9 px. Ningún filtro de apariencia la separa; sólo la
+señal temporal (lista negra). El detector global ya ve algo en 10 de 12 huecos,
+o sea **el cuello de botella no es la sensibilidad del detector**.
+
+### La pista real: el GATING, no el detector
+
+Clasificados los 1339 frames-hueco que deja la lista negra:
+
+```
+sólo la marca de penal          12%   <- hueco correcto
+sólo detrás / fuera de cancha    7%   <- hueco correcto
+candidato de JUEGO plausible    49%   <- el Viterbi lo rechazó por inalcanzable
+```
+
+El 49% tenía un candidato dentro de la cancha y lejos de la marca, y el gate de
+continuidad lo descartó por exceder el radio físico desde el ancla. Puede ser
+ruido legítimamente descartado o pelota real perdida — **no se puede saber sin
+ground truth denso de la pelota**, que no existe. Ése es el próximo hilo si se
+quiere subir la presencia, y necesita anotar la pelota frame a frame en un
+tramo, no mejorar el detector.
 
 ## `StaticGuard`: implementado y quitado tras medirlo
 
@@ -784,6 +807,7 @@ entera).
 | ReID (5701→1912 ids) | eventos idénticos |
 | Limpieza de pelota estática | **peor** (borraba la pelota real en pausas) |
 | Ball-crop (pelota 56,9%→83,2%) | AUC 0,678→0,619 |
+| Ball-crop **re-evaluado** con el mapa bueno (21-ago) | re-detecta la marca de penal en los huecos, 7 de 9 recuperaciones son basura |
 | Re-etiquetado controlado | precisión de propuestas 12%→10% |
 | Re-alineación post-hoc de coordenadas | deriva de 10 m, pelota peor |
 | T-DEED / action spotting para SHOT/GOAL | falla en footage no-broadcast |
