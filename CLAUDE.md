@@ -16,12 +16,53 @@ técnicas van completas, sin simplificar de más. Habla español (Argentina).
 
 ## Estado en una línea
 
-La calibración del **clip de 3 min** está cerrada (mosaico de líneas, 0,3-0,6 m
-de error) y la geometría del proyecto corregida a la reglamentaria. Falta
-calibrar **spain-france completo** (el partido con las 1416 etiquetas), que es
-por tramos y frágil de automatizar; hasta cerrar eso no se puede re-medir el
-AUC del clasificador. El enganche de la pelota (marca de penal + botellas
-detrás del arco) ya está resuelto con el mapa bueno.
+**La calibración está RESUELTA de forma escalable con PnLCalib** (modelo SOTA
+de registro de cancha): 0,56 m de error mediano, automático, 2,3 s por frame en
+CPU, en cualquier vista y cualquier partido. Reemplaza al modelo `martinjolif`
+(4-6 m, parche de 20 m) y a todo el método semi-manual del mosaico. Falta
+integrarlo al pipeline, re-proyectar spain-france y re-medir el AUC. El enganche
+de la pelota ya está resuelto.
+
+# ✅ CALIBRACIÓN ESCALABLE: PnLCalib (21-ago)
+
+`https://github.com/mguti97/PnLCalib` — "Sports Field Registration via Points
+and Lines Optimization". Detector de keypoints + líneas (HRNetV2) con pesos
+pre-entrenados (los `SV_FT_WC14_*`, fine-tuneados en el Mundial 2014, son los
+que se probaron) **+ un módulo de refinamiento contra las líneas** (la misma
+idea de `refine_homography.py`, pero integrada).
+
+MEDIDO sobre el frame 761 del clip, contra el ground truth a mano:
+
+```
+              error p50   arco   penal   círculo
+PnLCalib        0,56 m   0,31    0,32    0,81      <- automático, 2,3 s CPU
+martinjolif     26,9 m   14,1    13,8    42,0      <- el que usa main.py hoy
+```
+
+Y calibra **el frame central de spain-france que NO se pudo a mano** (círculo,
+línea media y áreas caen exactos). Usa la geometría reglamentaria 105x68 con
+área a 16,5 — idéntica a `pitch_config.py`, así que encaja directo.
+
+Por qué esto cierra el problema de raíz:
+- El modelo viejo detectaba 32 vértices en un parche de 20 m y su homografía
+  extrapolaba a 12-43 m. PnLCalib detecta puntos Y líneas por toda la cancha,
+  así que no extrapola.
+- Medido aparte: **el refinador local converge desde ≤7 m de error** (10→0,3 m;
+  25→0,4; 45→0,6; 70→no). PnLCalib ya da 0,56, o sea que ni siquiera hace falta
+  refinar más, pero si un frame saliera peor, el refinador cierra igual.
+
+Instalación (en un venv aparte, CPU): clonar el repo, `pip install -U
+ultralytics` ya trae torch; bajar `SV_FT_WC14_kp` y `SV_FT_WC14_lines` de los
+releases (265 MB c/u). La conversión de sus `cam_params` a homografía
+imagen→cancha (cm) está en el script del scratchpad (`pnl_test.py`): la
+proyección `P = Q·R·[I|-t]` y `H_cm→img = [P[:,0]/100, P[:,1]/100,
+P[:,3]-52.5·P[:,0]-34·P[:,1]]`.
+
+⚠️ Lo que queda de las secciones de abajo (mosaico, refinamiento, keypoints
+malos) es la HISTORIA de cómo se llegó acá, no el camino a seguir. El camino es
+PnLCalib.
+
+
 
 ---
 
