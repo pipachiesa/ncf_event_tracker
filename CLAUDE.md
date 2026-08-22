@@ -948,6 +948,39 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 
 ---
 
+# ¿Vale la pena re-calibrar spain-france para el AUC? (21-ago)
+
+**No hace falta re-trackear (6 h de GPU): el tracking ya existe con las
+coordenadas de imagen, re-calibrar es RE-PROYECTAR (CPU), como se hizo con el
+clip.** El costo real es calcular las homografías por tramo, que es semi-manual
+(leer líneas por tramo, ~15 tramos) porque el método automático es frágil.
+
+Evidencia de si vale la pena, sin calibrar nada (`ablation_features.py`):
+
+- **23 de 33 features del clasificador (70%) dependen de las coordenadas de
+  cancha**, que estaban corruptas (medido en el clip: 20-34 m de error por
+  evento, 4 de 22 con la pelota a >55 m del arco, imposible).
+- Ablación del AUC (leave-one-block-out, tracking viejo, 294 filas / 135 PASS):
+
+  | features | n | AUC |
+  |---|---|---|
+  | todas (coords rotas) | 36 | 0,574 |
+  | sólo NO-geométricas | 10 | 0,569 |
+  | sólo geométricas (rotas) | 26 | **0,606** |
+
+Las geométricas, **aun rotas, llevan la mayor señal** (0,606 solas, más que las
+no-geométricas). O sea: las features que más importan son las que están rotas.
+Arreglar lo que más pesa es el mayor potencial de mejora.
+
+⚠️ **Pero la magnitud es incierta.** Que suban de 0,606 a 0,70 o se queden en
+0,62 no se sabe sin re-entrenar con coords buenas. El AUC absoluto bajo (0,57)
+sugiere que puede haber otros límites (calidad de propuestas, ruido de
+etiquetas, 294 filas). La forma de saberlo con inversión mínima: **piloto de
+3-4 tramos** calibrados semi-manual (~2 h, sin GPU) → re-entrenar sobre ~200
+eventos → si sube claro, escalar al partido.
+
+---
+
 # Próximos pasos
 
 1. ~~`check_keypoint_coverage.py`~~ hecho: veredicto "acumular sirve con 60 s".
