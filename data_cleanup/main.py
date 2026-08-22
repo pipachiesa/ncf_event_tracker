@@ -406,6 +406,17 @@ def extract_keypoints(pitch_result, min_conf=DEFAULT_PITCH_CONF):
     return (np.where(mask)[0], key_points.xy[0][mask].astype(np.float32))
 
 
+class _MatrixTransformerLike:
+    """Envuelve una matriz imagen->cancha con la interfaz .transform_points
+    (para que la homografia de PnLCalib entre en el mismo camino de suavizado)."""
+    def __init__(self, H):
+        self.m = np.asarray(H, dtype=np.float32)
+    def transform_points(self, points):
+        import cv2
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+        return cv2.perspectiveTransform(pts, self.m).reshape(-1, 2)
+
+
 def solve_homography(frame_pts, pitch_pts, frame_w=None, frame_h=None,
                      min_points=MIN_HOMOGRAPHY_POINTS):
     """``(transformer, error_cm)`` o None si no pasa los controles de calidad.
@@ -1030,15 +1041,29 @@ def track(video_path, output_dir,
     ball_class_id = resolve_ball_class_id(ball_model)
 
     # Pitch keypoint model for homography (optional; falls back to image space).
+    # Calibracion. "pnlcalib" usa PnLCalib (SOTA, 0,56 m, ver pitch_calib.py);
+    # cualquier otro valor cae al detector de keypoints viejo (martinjolif).
     pitch_model = None
-    resolved_pitch_path = resolve_pitch_model_path(pitch_model_path)
-    if resolved_pitch_path:
+    pnl = None
+    if str(pitch_model_path).lower() == "pnlcalib":
         try:
-            pitch_model = YOLO(resolved_pitch_path)
+            from pitch_calib import PnLCalibrator
+            import torch
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            pnl = PnLCalibrator(device=dev)
+            print(f"Calibracion con PnLCalib (device={dev})")
         except Exception as exc:
-            print(f"Failed to load pitch model '{resolved_pitch_path}' ({exc}); "
-                  f"using image-space coords (no homography)")
-            pitch_model = None
+            print(f"No pude cargar PnLCalib ({exc}); sin homografia")
+            pnl = None
+    else:
+        resolved_pitch_path = resolve_pitch_model_path(pitch_model_path)
+        if resolved_pitch_path:
+            try:
+                pitch_model = YOLO(resolved_pitch_path)
+            except Exception as exc:
+                print(f"Failed to load pitch model '{resolved_pitch_path}' ({exc}); "
+                      f"using image-space coords (no homography)")
+                pitch_model = None
 
     ellipse_annotator = triangle_annotator = label_annotator = None
     if generate_video:
@@ -1164,7 +1189,18 @@ def track(video_path, output_dir,
         # keypoints de un frame solo NO alcanzan (cubren ~20 m de cancha), asi
         # que se acumulan los de los ultimos refrescos arrastrandolos con el
         # movimiento de camara. Ver KEYPOINT_BUFFER_REFRESHES.
-        if pitch_model is not None and (frame_number - 1) % homography_every == 0:
+        if pnl is not None and (frame_number - 1) % homography_every == 0:
+            # PnLCalib da la homografia del frame directo (no necesita buffer ni
+            # acumulacion: ve toda la cancha, no un parche). Se suaviza igual.
+            Hd = pnl.homography(frame)
+            if Hd is None:
+                n_homog_rejected += 1
+            else:
+                new_transformer = _MatrixTransformerLike(Hd)
+                sm, smooth_pitch = smooth_transformer(new_transformer, canon_img, smooth_pitch)
+                transformer = sm if sm is not None else new_transformer
+                n_homog_ok += 1
+        elif pitch_model is not None and (frame_number - 1) % homography_every == 0:
             # 1. Detectar PRIMERO. Los vertices de cancha son el mejor
             #    estimador del movimiento de camara: estan quietos, asi que su
             #    desplazamiento en pantalla es el de la camara y punto. La
@@ -1283,7 +1319,10 @@ def track(video_path, output_dir,
         sink.__exit__(None, None, None)
 
     total_h = n_homog_ok + n_homog_rejected + n_homog_jumps
-    if total_h:
+    if total_h and pnl is not None:
+        print(f"Homografia (PnLCalib): {n_homog_ok} aceptadas, "
+              f"{n_homog_rejected} sin calibrar ({100.0*n_homog_rejected/total_h:.1f}%)")
+    elif total_h:
         sx, sy = kp_buffer.pitch_span()
         drag = kp_buffer.drag_error_p50()
         print(f"Keypoints acumulados al final: {len(kp_buffer.seen)} vertices "
@@ -1369,9 +1408,10 @@ def parse_args():
                         help="Inference resolution (default 1280). Higher recovers more small "
                              "ball detections but is slower; 640 is the fast/low-recall option.")
     parser.add_argument("--pitch-model", default=DEFAULT_PITCH_MODEL,
-                        help="Pitch keypoint model for homography. 'football-field' (default) "
-                             "downloads it from the HF Hub; 'none' disables homography and uses "
-                             "image-space coords; or pass a path to a .pt file.")
+                        help="Calibracion imagen->cancha. 'pnlcalib' (RECOMENDADO, SOTA, "
+                             "0,56 m; requiere PnLCalib clonado + PNLCALIB_DIR, ver "
+                             "pitch_calib.py); 'football-field' el detector viejo (26,9 m); "
+                             "'none' sin homografia; o un path a .pt.")
     parser.add_argument("--pitch-conf", type=float, default=DEFAULT_PITCH_CONF,
                         help="Min keypoint confidence used in the homography (default 0.5).")
     parser.add_argument("--homography-every", type=int, default=DEFAULT_HOMOGRAPHY_EVERY,
