@@ -14,14 +14,133 @@ balón parado, duelos, aéreos, tiros, goles, faltas.
 Felipe es estudiante de Data Science y trabaja en el rubro. Las explicaciones
 técnicas van completas, sin simplificar de más. Habla español (Argentina).
 
-## Estado en una línea
+**La cámara** (importante para todo lo de abajo): broadcast AMATEUR, un solo
+ángulo, se MUEVE y sigue la pelota (paneo). No es cámara fija; tampoco es
+multi-cámara de Mundial. Por eso la homografía cambia por frame (paneo) y por eso
+la triangulación 3D multi-cámara de los demos virales NO aplica. Que la cámara
+siga la pelota no la salva del blur ni de las transiciones donde la cámara se
+atrasa y la pelota queda chica/lejana un momento.
 
-**La calibración está RESUELTA de forma escalable con PnLCalib** (modelo SOTA
-de registro de cancha): 0,56 m de error mediano, automático, 2,3 s por frame en
-CPU, en cualquier vista y cualquier partido. Reemplaza al modelo `martinjolif`
-(4-6 m, parche de 20 m) y a todo el método semi-manual del mosaico. Falta
-integrarlo al pipeline, re-proyectar spain-france y re-medir el AUC. El enganche
-de la pelota ya está resuelto.
+## Estado en una línea (actualizado 25-ago)
+
+**Calibración RESUELTA e integrada** (PnLCalib, `main.py --pitch-model pnlcalib`,
+0,56 m, automático). **Pelota MEDIDA por fin contra ground truth**: estaba bien
+solo 35% → subida a **45%** con un fix de una línea en el Viterbi (el enganche NO
+estaba resuelto como decía este doc antes; ahora sí bajó de 3,6x a 0,9x). El
+techo de la pelota (54% de frames) es el DETECTOR frame-a-frame → lo sube WASB
+(en fine-tune). **La pregunta abierta del proyecto**: ¿el techo de AUC 0,58 era
+la calibración rota? Se está midiendo: re-calibrando spain-france con pnlcalib
+(Colab) para re-entrenar el clasificador con coords buenas. Baseline a batir:
+**AUC 0,584**.
+
+# ✅ LA PELOTA, MEDIDA DE VERDAD (24-25 ago) — la regla nueva y el fix del Viterbi
+
+Durante semanas la pelota se evaluó con PROXIES (pelota/jugadores en el área,
+celdas sobre-visitadas). Felipe insistió: "sin medir bien la pelota no se pueden
+medir eventos". Tenía razón. Ahora hay **ground truth**:
+`events_model/dataset/ball_gt/spain-france_ball_labels.csv` (889 frames
+etiquetados a mano, 538 con pelota visible, alinean con el clip de 3 min).
+
+**LA REGLA NUEVA: % de frames con la pelota del pipeline a ≤100 px de la
+verdad.** Nada de proxies. Se mide leyendo la pelota del tracking CSV (centro de
+la caja) contra los labels; local, segundos.
+
+### El estado real de la pelota (contra los labels, mapa pnlcalib bien calibrado)
+
+```
+                         acc@100px   síntoma pelota/jug   imposibles
+baseline (Viterbi viejo)    26%           3,6x              0,1%
++ fix blacklist celda 2m    45%           0,9x              0,5%
+oráculo (techo selección)   55,8%          -                 -
+```
+
+El error es BIMODAL: o <20 px (le pega) o >100 px (enganchada a otra cosa), casi
+nada en el medio. Cuando la tiene, la precisión es **87%**.
+
+### El fix (una línea, +19 puntos): la celda del blacklist
+
+`ball_viterbi.static_penalties` penaliza celdas que reaparecen todo el partido
+(la marca de penal, líneas). Usaba celdas de **0,6 m**, y la marca se detecta con
+ruido y se reparte en ~4 celdas → ninguna pasaba el umbral → **la marca evadía el
+veto**. Con celda de **2,0 m** (umbral 3%) todo el cluster cuenta junto y se
+penaliza. Casi duplica la exactitud (26→45%) y **mata el enganche** (3,6x→0,9x:
+ahora la pelota está MENOS en el área que los jugadores).
+⚠️ El pico 2,0m/3% es agudo (2,2 m baja a 30%): está tuneado sobre este clip. El
+mecanismo es sólido pero el valor exacto puede correrse en otra cámara. Validar
+en el partido completo.
+
+### La causa del techo: NO es selección, es detección (→ WASB)
+
+Diagnóstico sobre los 538 GT-visibles:
+
+```
+detector NO ve la pelota (ni candidato cerca)   238  (44%)   -> techo, WASB
+la ve y el path ACIERTA                          242  (45%)
+la ve pero es aislada -> el path va a MISSING     52  (10%)   -> tambien WASB
+la ve y elige lejos                                6   (1%)
+```
+
+Los 52 "de selección" son **100% apariciones de un solo frame** (sin pelota real
+en los vecinos ±2). El Viterbi hace bien en rechazarlos (una detección suelta =
+ruido); NADA los recupera tuneando (MISSING_COST, MAX_MISSING_RUN no mueven
+nada). O sea el gap que queda (54%) **es UN solo problema**: el detector
+frame-a-frame pierde/aísla la pelota. Lo único que lo sube es **detección
+temporal (WASB)**, que la ve en los frames vecinos y convierte puntos sueltos en
+trayectorias que el Viterbi sí acepta. Fine-tune de WASB ya iniciado
+(`event_generation/wasb_finetune.ipynb`, `make_wasb_dataset.py`, `label_ball.py`).
+
+# ❌ SAHI (slicing) — PROBADO Y DESCARTADO (24-ago)
+
+Idea del blog de roboflow: partir el frame en tiles para que la pelota lejana
+ocupe más píxeles. Micro-test (24 frames GT) prometía (pelotas a >60 m: conf
+0,14-0,37 → 0,36-0,58). **Pero end-to-end falla** (`data_cleanup/sahi_huecos.py`,
+segunda pasada solo en huecos, medido sobre el clip):
+
+```
+                acc@100   síntoma   nota
+baseline           26%      3,6x
++ SAHI en huecos   ~34%     3,3x    +221 frames PERO 39% caen en la marca de penal
+```
+
+En un hueco no hay señal temporal, y la marca es idéntica a la pelota por
+apariencia, así que SAHI (puro recall) la re-detecta. **Mismo modo de falla que
+el ball-crop.** El cuello de botella NO es el recall de un detector frame-a-frame;
+es la falta de temporalidad. Por eso WASB, no SAHI ni RF-DETR. El script y el
+notebook quedan en el repo pero NO se integran.
+
+# 🔎 Revisión de referencias externas (24-ago) — nada saltea la pelota
+
+Felipe mandó varios links (roboflow/trackers, roboflow/sports, GhostBall-Engine,
+Tennis-Ball-Tracker, Alex Bodner, posts de X/LinkedIn del "partido animado 3D" y
+"predicción de pases"). Revisados a fondo:
+
+- **Todos usan detección de pelota frame-a-frame** (YOLO / RF-DETR). Ninguno es
+  temporal. El proyecto ya los supera con la dirección WASB.
+- **El "3D animado"** es game-state / radar cenital (homografía + tracking) o 3D
+  por triangulación multi-cámara. NECESITA la pelota detectada primero; no la
+  reemplaza. Se ve bien porque es footage de broadcast + varias cámaras + clips
+  elegidos. (El de SoccerNet-v3D es del mismo autor que PnLCalib, mguti97.)
+- **La predicción de pases** (Alex Bodner: RF-DETR + BoT-SORT + detectores de
+  balón/jugadores + keypoints) es un modelo ARRIBA del tracking; muchas veces
+  funciona casi solo con posiciones de jugadores.
+- **RF-DETR** es un movimiento lateral (otro detector frame-a-frame), no ataca la
+  causa (temporalidad). Los jugadores no son el cuello de botella. No vale el
+  costo de cambiarlo. Detalle en la memoria `revision-links-roboflow-agosto`.
+
+# ⏳ EN CURSO (25-ago): ¿la calibración era el techo del AUC?
+
+Baseline reproducido local: **AUC 0,584, "sin señal"** (206 transiciones, 111
+PASS, coords VIEJAS rotas). Las etiquetas (~388 eventos en 3 bloques: min 10-18,
+26-34, 64-72) son del partido spain-france completo; su tracking
+(`events_model/dataset/spain-france/tracking.csv`, 182 MB) tiene coords viejas.
+
+Plan en marcha (por re-PROYECCIÓN, no re-track): `recalibrate_spain_france_colab.ipynb`
+corre pnlcalib en GPU SOLO en los frames de las 3 ventanas → guarda la homografía
+por frame (`spain-france_homographies.json`). Después, local: re-proyectar el
+tracking existente con esas H + aplicar el fix del Viterbi + re-generar features +
+re-entrenar. **Si el AUC sube de 0,584 → la calibración rota era el techo y el
+proyecto se destraba. Si no → el límite es otro (calidad de propuestas, ruido de
+etiquetas, 294 filas).** Prerrequisito: subir `spain-france.mp4` (1,4 GB) a Drive.
 
 # ✅ CALIBRACIÓN ESCALABLE: PnLCalib (21-ago)
 
@@ -719,6 +838,13 @@ funcionar. Re-medirlo es el próximo paso.
 
 # La pelota: qué se probó y qué quedó
 
+> ⚠️ **HISTORIA — leer primero la sección "LA PELOTA, MEDIDA DE VERDAD (24-25
+> ago)" arriba.** Todo lo de abajo se midió con PROXIES (pelota/jugadores en el
+> área, celdas), no contra ground truth. Varias conclusiones ("el veto ya
+> funciona", "el enganche está resuelto") eran optimistas: medida contra los
+> labels, la pelota estaba bien solo 26%, subida a 45% con el fix de la celda del
+> blacklist. El resto de esta sección es cómo se llegó ahí, no el estado actual.
+
 Selección actual en `_pick_ball`: **gate de continuidad** (radio físico en cm,
 `MAX_BALL_SPEED_MS=40`, crece con el hueco) **+ rechazo duro fuera de cancha**
 (`BALL_OFFPITCH_MARGIN=0.04`). Nada más.
@@ -876,7 +1002,7 @@ entera).
 | Ball-crop **re-evaluado** con el mapa bueno (21-ago) | re-detecta la marca de penal en los huecos, 7 de 9 recuperaciones son basura |
 | Re-etiquetado controlado | precisión de propuestas 12%→10% |
 | Re-alineación post-hoc de coordenadas | deriva de 10 m, pelota peor |
-| T-DEED / action spotting para SHOT/GOAL | falla en footage no-broadcast |
+| T-DEED / action spotting para SHOT/GOAL | falla en footage broadcast amateur (un ángulo) |
 | Reescribir la generación de candidatos | el recall de MOMENTOS ya es ~100% |
 
 Sobre el último: el **100%** de los pases agregados a mano caían a menos de 3 s
@@ -948,6 +1074,8 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 | `check_homography.py` | ESTABILIDAD (que no salte) **y** CALIBRACIÓN (que apunte bien). Sin ground truth ni video. |
 | `check_pitch_keypoints.py` | Qué keypoints se usan, cuánta cancha cubren, error de reproyección. **Correr en Colab** (necesita los modelos). |
 | `check_keypoint_coverage.py` | Techo de cobertura de cancha por ventana de tiempo, y mejores frames de referencia. **Colab.** |
+| **pelota vs labels** | **LA REGLA DE LA PELOTA**: % de frames con la pelota a ≤100 px de `ball_gt/spain-france_ball_labels.csv`. No hay script fijo aún; se mide ad hoc (ver la sección "LA PELOTA, MEDIDA DE VERDAD"). Local, segundos. NO usar proxies (pelota/jugadores) para juzgar la pelota. |
+| `sahi_huecos.py` | Segunda pasada SAHI en huecos. DESCARTADO (ver sección), queda de referencia. |
 | `benchmark.py` | tracking + eventos con las mismas métricas siempre |
 
 ---
@@ -1022,29 +1150,29 @@ eventos → si sube claro, escalar al partido.
 
 ---
 
-# Próximos pasos
+# Próximos pasos (25-ago)
 
-1. ~~`check_keypoint_coverage.py`~~ hecho: veredicto "acumular sirve con 60 s".
-2. Re-trackear el clip con `KEYPOINT_BUFFER_REFRESHES = 180` y el buffer
-   indexado por vértice. Mirar, en este orden: el **error de arrastre**
-   (< 10 px), el **rechazo de homografías** (si pasa 80% el mapa está
-   congelado y no hay que leer nada más), y recién ahí la calibración.
-3. `check_homography.py` sobre el CSV nuevo. Baseline a batir, de la última
-   corrida buena (`..._crop (3).csv`, 18-ago 09:44):
+1. **EN CURSO — el test del AUC.** Correr `recalibrate_spain_france_colab.ipynb`
+   (pnlcalib en las 3 ventanas → homografías). Después, local: re-proyectar el
+   tracking del partido con esas H, aplicar el fix del Viterbi (celda 2m), re-
+   generar features y re-entrenar. **Batir AUC 0,584.** Sube → la calibración era
+   el techo. No sube → el límite es otro (propuestas, ruido de etiquetas, n=294).
+2. **WASB** (detección temporal de pelota): la única palanca que queda para la
+   pelota (techo del detector, 54% de frames). Fine-tune ya iniciado. La regla
+   para medirlo: % a ≤100 px de los labels (hoy 45%; oráculo de selección 55,8%;
+   WASB debería subir el propio oráculo porque detecta la pelota en más frames).
+3. Si el AUC sube en el piloto (3 ventanas): escalar al partido completo y a más
+   partidos (psg_bayern, brasil_noruega ya tienen video).
+4. Pendiente de bajo costo ya identificado: SigLIP+UMAP+KMeans para clasificar
+   equipos (mejor que el k-means de color actual) — ver la revisión de links.
 
-   | | hoy | objetivo |
-   |---|---|---|
-   | `x: p01` (arquero en cámara) | 4,6 m | ~0 |
-   | `x: p99` | 102,4 m | ~120 |
-   | detecciones fuera de los límites | 11% | <5% |
-   | saltos >1 m | 7,04% | menos |
-   | **pelota dentro del área** | **58,6%** | **~19,7%** |
+## La cadena, hoy
 
-   El bloque CALIBRACION tiene que pasar de "MAL CALIBRADA" a "plausible".
-3. La métrica del síntoma es la última fila: es la que traduce lo que Felipe ve.
-4. Recién ahí: partido completo (~2,5 h), cadena de limpieza completa, y
-   **re-entrenar sobre las etiquetas que ya existen** (están ancladas a frames y
-   el video no cambió, no hay que re-etiquetar).
-5. La pregunta que responde todo esto: **¿el techo de AUC 0,6-0,68 era la
-   homografía?** Si sube, las features nunca fueron el problema — estaban
-   escritas en un sistema de coordenadas equivocado.
+```
+main.py --pitch-model pnlcalib   (Colab GPU: tracking + candidatos con coords buenas)
+  → ball_viterbi.py              (celda 2m/3% ← FIX 24-ago; NO saltear)
+  → reid.py → clean_offpitch.py
+  → propose_events.py → label_tool.py (ya etiquetado) → train.py
+```
+Para re-medir el AUC sobre spain-france NO hace falta re-trackear: re-proyectar
+(las coords de imagen ya están en el CSV) + re-Viterbi + re-entrenar.
