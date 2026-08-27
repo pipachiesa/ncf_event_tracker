@@ -238,6 +238,13 @@ class EventGenerator():
                 player, dist, _ = self._nearest_player(moment, ball_norm)
                 if player is not None and dist is not None and dist <= self.possession_radius:
                     holder = player
+                    # holder_loc = la PELOTA (no los pies del poseedor). PROBADO
+                    # 26-ago con los pies (idea de Sol: la homografia no vale para
+                    # la pelota en el aire): el AUC EMPEORO 0,579->0,549. Los
+                    # endpoints caen en los bordes de la posesion, donde la pelota
+                    # esta cerca del piso, asi que la proyeccion aerea no los
+                    # afecta; y usar el pie del "poseedor" mete ruido cuando la
+                    # pelota mal-asigno al jugador. La pelota es mejor endpoint.
                     holder_loc = ball_norm
 
             if holder is None:
