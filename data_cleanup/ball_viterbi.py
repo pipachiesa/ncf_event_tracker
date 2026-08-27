@@ -107,7 +107,7 @@ def load_candidates(path):
     return by_frame
 
 
-def static_penalties(by_frame, cell_m=0.6, min_hits=None, weight=3.0):
+def static_penalties(by_frame, cell_m=2.0, min_hits=None, weight=3.0):
     """Penaliza posiciones que REAPARECEN todo el partido en el mismo lugar.
 
     Es la senal que un filtro causal no puede usar: el punto de penal, una
@@ -116,6 +116,25 @@ def static_penalties(by_frame, cell_m=0.6, min_hits=None, weight=3.0):
     veces. Sin esto el solver prefiere justamente el objeto quieto, porque
     quedarse inmovil no cuesta nada en la transicion y las marcas suelen tener
     MAS confianza que una pelota borrosa.
+
+    ⚠️ ``cell_m`` era 0,6 m y NO servia: la marca de penal se detecta con ruido
+    y sus candidatos se REPARTEN en ~4 celdas de 0,6 m ((10,35),(10,36),(11,34),
+    (11,35)...), asi que ninguna celda sola pasaba el umbral y la marca evadia el
+    veto. MEDIDO contra los labels a mano de la pelota (regla nueva: % de frames
+    con la pelota a <=100 px de la verdad), sobre el clip pnlcalib:
+
+        cell_m   umbral   acc@100   (oraculo/techo de seleccion: 55,8%)
+          0,6      5%       25,7%     <- viejo
+          0,6      3%       31,8%
+          2,0      5%       39,4%
+          2,0      3%       45,0%     <- elegido
+          2,5      3%       40,1%
+
+    Con celda de 2 m TODO el cluster de la marca cae en UNA celda, pasa el
+    umbral y se penaliza. Casi duplica la exactitud (26 -> 45%, 80% del techo).
+    El pico en 2,0/3% es agudo (2,2 m baja a 30%) porque depende de como cae la
+    grilla sobre la marca; en otra camara el optimo puede correrse, pero
+    cualquier celda 2,0-2,5 m supera con holgura al 0,6 m viejo.
 
     Devuelve {(frame, idx_candidato): penalizacion}.
     """
@@ -130,20 +149,12 @@ def static_penalties(by_frame, cell_m=0.6, min_hits=None, weight=3.0):
 
     n_frames = max(1, len(by_frame))
     if min_hits is None:
-        # Una posicion presente en mas del 5% de los frames del partido no es
-        # una pelota en juego: es parte de la cancha.
-        #
-        # ⚠️ El umbral era 2% y da PEOR. MEDIDO sobre el clip re-calibrado
-        # (mapa nuevo, coords 105x68), barriendo el umbral con weight 3:
-        #     umbral   pelota/jug   frames   imposibles   huecos>15f
-        #       2%       2,2x        1080       2,7%          7%
-        #       4%       2,0x        1221       2,2%          4%
-        #       6%       1,9x        1287       2,1%          2%
-        # A 2% penaliza celdas por las que la pelota REAL pasa varias veces
-        # (zonas de juego), y al vetarlas pierde pelota real -> mas huecos.
-        # A 5-6% solo caen la marca de penal (21,7% en una celda de 50 cm) y
-        # los clusters fijos de atras del arco, que es lo que hay que sacar.
-        min_hits = max(20, int(0.05 * n_frames))
+        # Una posicion presente en mas del 3% de los frames del partido no es
+        # una pelota en juego: es parte de la cancha. Con la celda de 0,6 m el
+        # optimo era 5% (a 2% se comia zonas de juego); con la celda de 2 m,
+        # que agrupa el cluster entero de la marca, el optimo bajo a 3% (ver la
+        # tabla del docstring, medida contra los labels a mano de la pelota).
+        min_hits = max(20, int(0.03 * n_frames))
 
     pen = {}
     for f, cands in by_frame.items():
