@@ -1171,21 +1171,41 @@ eventos → si sube claro, escalar al partido.
 
 ---
 
-# Próximos pasos (25-ago)
+# Próximos pasos (26-ago)
 
-1. **EN CURSO — el test del AUC.** Correr `recalibrate_spain_france_colab.ipynb`
-   (pnlcalib en las 3 ventanas → homografías). Después, local: re-proyectar el
-   tracking del partido con esas H, aplicar el fix del Viterbi (celda 2m), re-
-   generar features y re-entrenar. **Batir AUC 0,584.** Sube → la calibración era
-   el techo. No sube → el límite es otro (propuestas, ruido de etiquetas, n=294).
-2. **WASB** (detección temporal de pelota): la única palanca que queda para la
-   pelota (techo del detector, 54% de frames). Fine-tune ya iniciado. La regla
-   para medirlo: % a ≤100 px de los labels (hoy 45%; oráculo de selección 55,8%;
-   WASB debería subir el propio oráculo porque detecta la pelota en más frames).
-3. Si el AUC sube en el piloto (3 ventanas): escalar al partido completo y a más
-   partidos (psg_bayern, brasil_noruega ya tienen video).
-4. Pendiente de bajo costo ya identificado: SigLIP+UMAP+KMeans para clasificar
-   equipos (mejor que el k-means de color actual) — ver la revisión de links.
+El test del AUC ya se hizo (calibración descartada como techo; ver la sección de
+arriba). El foco cambia: **no perseguir tracking perfecto ni eventos 100%
+automáticos, sino una herramienta útil** — autoacepta lo muy confiable, deja el
+resto en una cola de revisión rápida. La métrica de producto: cuánto tiempo tarda
+una persona en corregir un partido (hoy manual ~90 min → objetivo 20-30 de revisión).
+
+1. **Congelar el sistema de evaluación** ANTES de otro experimento: dos comandos
+   reproducibles (pelota: acc@20/50/100, recall detector vs post-Viterbi, aisladas,
+   huecos, FP en la marca, por tercio/paneo/transición; eventos: ROC-AUC **y
+   PR-AUC**, precision@recall, leave-one-match-out). No volver a tunear sobre los
+   mismos 538 positivos del clip.
+2. **WASB** (techo del detector, 54%): reescribir el notebook (config completa del
+   Trainer, QFL + hard mining, dataloader train activo, split temporal, pesos
+   soccer bien cargados — ⚠️ HOY el notebook NO corre). Medir WASB **preentrenado**
+   antes del fine-tune. A/B: YOLO 15fps vs 30fps vs WASB 15/30fps vs WASB fine-tune.
+   Integrar como **candidatos** (top-K del heatmap → fusión con YOLO → Viterbi), NO
+   como tracker final. Éxito = 45% → 60-65% @100px en validación SEPARADA, precisión
+   ≥85%, menos aisladas. La pelota puede tener rama propia a 30 fps.
+3. **Segundo partido EN PARALELO** (no esperar a WASB): n=296 de un partido es el
+   problema estadístico mayor. Etiquetar PASS/NONE en 3-4 ventanas del partido más
+   DISTINTO (otra cámara/camisetas/estadio) → cross-match real (train sf→test otro,
+   y viceversa). ⚠️ al mejorar la pelota cambian las propuestas: las nuevas NO son
+   negativos automáticos (lección #7).
+4. Clasificador con **features de incertidumbre** (conf de pelota, % observado vs
+   interpolado, hueco alrededor del evento, calidad de homografía, indicador de
+   vuelo). Seguir con HistGradientBoosting; cambiar de modelo no arregla datos.
+5. La marca de penal, solo si WASB sigue fallando ahí: residual temporal
+   compensado por homografía (no re-tunear la celda 2m, está sobreajustada).
+6. Bajo costo ya identificado: SigLIP+UMAP+KMeans para clasificar equipos.
+
+**Riesgo principal**: gastar semanas puliendo la pelota sobre un clip y descubrir
+que el clasificador no generaliza. Por eso pelota y segundo partido son dos
+frentes del MISMO hito. (Plan detallado: feedback de los agentes, 26-ago.)
 
 ## La cadena, hoy
 
