@@ -1095,7 +1095,8 @@ Fork: `https://github.com/pipachiesa/ncf_event_tracker`.
 | `check_homography.py` | ESTABILIDAD (que no salte) **y** CALIBRACIÓN (que apunte bien). Sin ground truth ni video. |
 | `check_pitch_keypoints.py` | Qué keypoints se usan, cuánta cancha cubren, error de reproyección. **Correr en Colab** (necesita los modelos). |
 | `check_keypoint_coverage.py` | Techo de cobertura de cancha por ventana de tiempo, y mejores frames de referencia. **Colab.** |
-| **pelota vs labels** | **LA REGLA DE LA PELOTA**: % de frames con la pelota a ≤100 px de `ball_gt/spain-france_ball_labels.csv`. No hay script fijo aún; se mide ad hoc (ver la sección "LA PELOTA, MEDIDA DE VERDAD"). Local, segundos. NO usar proxies (pelota/jugadores) para juzgar la pelota. |
+| `eval_ball.py` | **LA REGLA DE LA PELOTA** (evaluador reproducible): acc@20/50/100px vs `ball_gt/*_ball_labels.csv`, precisión, recall del detector vs post-Viterbi (brecha de selección), aisladas, huecos, por tercio de imagen. Local, segundos. NO usar proxies. |
+| `eval_events.py` | **Evaluador de eventos**: ROC-AUC **y PR-AUC**, precision@recall (tiempo de revisión), leave-one-block-out. Separado de train.py. |
 | `sahi_huecos.py` | Segunda pasada SAHI en huecos. DESCARTADO (ver sección), queda de referencia. |
 | `benchmark.py` | tracking + eventos con las mismas métricas siempre |
 
