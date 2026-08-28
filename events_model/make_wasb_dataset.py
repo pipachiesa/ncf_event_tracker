@@ -1,11 +1,13 @@
 """Convierte los labels de label_ball.py al formato de dataset de WASB-SBDT
 (frames PNG numerados + XML estilo CVAT por clip) para fine-tunear wasb_soccer.
 
-WASB (datasets/soccer.py) espera:
-    <root>/frames/<video>/<clip>/00001.png ...   (frames consecutivos)
-    <root>/annos/<video>/<clip>.xml              (CVAT: x,y,outside,occluded,used_in_game)
-y usa secuencias de 3 frames consecutivos, asi que se extraen TODOS los frames
-del rango (no solo los anotados). El fine-tune parte de wasb_soccer_best.pth.tar.
+WASB (datasets/soccer.py) espera (VERIFICADO contra el repo nttcom/WASB-SBDT):
+    <root>/frames/<video>/00000.png ...   (0-INDEXED, frames consecutivos, plano)
+    <root>/annos/<video>.xml              (CVAT: x,y,outside,occluded,used_in_game)
+donde <video> es el nombre del clip (NO hay nivel extra anidado). El loader arma
+`'{:05d}.png'.format(fid)` con fid desde 0 y matchea el atributo frame= del XML.
+Usa secuencias de 3 frames consecutivos, asi que se extraen TODOS los frames del
+rango (no solo los anotados). El fine-tune parte de wasb_soccer_best.pth.tar.
 
 ⚠️ BUG ARREGLADO (25-ago): los labels de Felipe estan cada ~3 frames. La version
 anterior marcaba TODOS los frames intermedios (no anotados) como visible=0, o sea
@@ -16,8 +18,8 @@ se INTERPOLA la posicion (la pelota es suave en 0,1-0,2 s) y se marca visible.
 Un frame etiquetado explicitamente no-visible, o no bracketeado por dos visibles
 cercanos, queda outside=1 (negativo real / desconocido).
 
-⚠️ PENDIENTE DE VERIFICAR contra el repo WASB: aca se escribe 00001.png con fid
-1-indexado; confirmar si `datasets/soccer.py` indexa desde 0 o desde 1.
+Nota: el config del notebook de WASB debe usar frame_dirname="frames",
+anno_dirname="annos" y videos=[<clip>] para que las rutas coincidan.
 
 Uso:
     python3 events_model/make_wasb_dataset.py \\
@@ -77,8 +79,8 @@ def main():
         t = (f - a) / (b - a)
         return (ax + (bx - ax) * t, ay + (by - ay) * t, 1)
 
-    fdir = os.path.expanduser(os.path.join(args.out, "frames", "match", args.clip))
-    adir = os.path.expanduser(os.path.join(args.out, "annos", "match"))
+    fdir = os.path.expanduser(os.path.join(args.out, "frames", args.clip))
+    adir = os.path.expanduser(os.path.join(args.out, "annos"))
     os.makedirs(fdir, exist_ok=True)
     os.makedirs(adir, exist_ok=True)
 
@@ -90,7 +92,7 @@ def main():
         ok, fr = cap.read()
         if not ok:
             break
-        fid = csv_frame - lo + 1               # 1-indexed en el clip
+        fid = csv_frame - lo                   # 0-indexed (loader WASB es 0-based)
         cv2.imwrite(os.path.join(fdir, f"{fid:05d}.png"), fr)
         x, y, v = dense_label(csv_frame)
         if v and csv_frame not in lab:
@@ -114,9 +116,10 @@ def main():
         fh.write("\n".join(xml))
 
     vis = sum(1 for _f, _x, _y, v in tracks if v)
-    print(f"{len(tracks)} frames extraidos, {vis} con pelota "
-          f"({n_interp} interpolados, {vis - n_interp} anotados), en {args.out}")
-    print(f"config: dataset root_dir={os.path.expanduser(args.out)}, video=match, clip={args.clip}")
+    print(f"{len(tracks)} frames extraidos ({tracks[0][0]:05d}.png..{tracks[-1][0]:05d}.png), "
+          f"{vis} con pelota ({n_interp} interpolados, {vis - n_interp} anotados), en {args.out}")
+    print(f"config WASB: root_dir={os.path.expanduser(args.out)}  videos=['{args.clip}']  "
+          f"frame_dirname='frames'  anno_dirname='annos'")
 
 
 if __name__ == "__main__":
