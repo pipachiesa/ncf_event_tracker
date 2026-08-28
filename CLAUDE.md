@@ -21,17 +21,17 @@ la triangulación 3D multi-cámara de los demos virales NO aplica. Que la cámar
 siga la pelota no la salva del blur ni de las transiciones donde la cámara se
 atrasa y la pelota queda chica/lejana un momento.
 
-## Estado en una línea (actualizado 25-ago)
+## Estado en una línea (actualizado 26-ago)
 
 **Calibración RESUELTA e integrada** (PnLCalib, `main.py --pitch-model pnlcalib`,
-0,56 m, automático). **Pelota MEDIDA por fin contra ground truth**: estaba bien
-solo 35% → subida a **45%** con un fix de una línea en el Viterbi (el enganche NO
-estaba resuelto como decía este doc antes; ahora sí bajó de 3,6x a 0,9x). El
-techo de la pelota (54% de frames) es el DETECTOR frame-a-frame → lo sube WASB
-(en fine-tune). **La pregunta abierta del proyecto**: ¿el techo de AUC 0,58 era
-la calibración rota? Se está midiendo: re-calibrando spain-france con pnlcalib
-(Colab) para re-entrenar el clasificador con coords buenas. Baseline a batir:
-**AUC 0,584**.
+0,56 m). **Pelota MEDIDA contra ground truth**: bien solo 35% → **45%** con un fix
+de una línea en el Viterbi (enganche 3,6x→0,9x). **El test del AUC ya se hizo: la
+calibración NO era el techo** (0,584→0,579 con coords buenas); la ablación muestra
+que **el AUC está limitado por la PELOTA** (features de jugadores mejoran, las de
+pelota no, porque la pelota sigue 45%). **La única palanca que queda es WASB**
+(detección temporal, techo del detector 54% de frames) + más partidos etiquetados
+(n=296 de un partido es frágil). Dataset de WASB ya corregido; falta reescribir el
+notebook de fine-tune (config del Trainer, QFL). Baseline a batir: **AUC 0,58**.
 
 # ✅ LA PELOTA, MEDIDA DE VERDAD (24-25 ago) — la regla nueva y el fix del Viterbi
 
@@ -127,20 +127,41 @@ Tennis-Ball-Tracker, Alex Bodner, posts de X/LinkedIn del "partido animado 3D" y
   causa (temporalidad). Los jugadores no son el cuello de botella. No vale el
   costo de cambiarlo. Detalle en la memoria `revision-links-roboflow-agosto`.
 
-# ⏳ EN CURSO (25-ago): ¿la calibración era el techo del AUC?
+# ✅ RESUELTO (26-ago): la calibración NO era el techo del AUC — es la PELOTA
 
-Baseline reproducido local: **AUC 0,584, "sin señal"** (206 transiciones, 111
-PASS, coords VIEJAS rotas). Las etiquetas (~388 eventos en 3 bloques: min 10-18,
-26-34, 64-72) son del partido spain-france completo; su tracking
-(`events_model/dataset/spain-france/tracking.csv`, 182 MB) tiene coords viejas.
+**Test hecho.** Se re-calibró spain-france con pnlcalib (homografías por frame de
+las 3 ventanas etiquetadas vía `recalibrate_spain_france_colab.ipynb`, GPU), se
+re-proyectó el tracking existente (`data_cleanup/reproject_from_homographies.py`,
+NO re-track: reusa las detecciones), re-Viterbi (celda 2m) y re-entrenó `train.py`.
 
-Plan en marcha (por re-PROYECCIÓN, no re-track): `recalibrate_spain_france_colab.ipynb`
-corre pnlcalib en GPU SOLO en los frames de las 3 ventanas → guarda la homografía
-por frame (`spain-france_homographies.json`). Después, local: re-proyectar el
-tracking existente con esas H + aplicar el fix del Viterbi + re-generar features +
-re-entrenar. **Si el AUC sube de 0,584 → la calibración rota era el techo y el
-proyecto se destraba. Si no → el límite es otro (calidad de propuestas, ruido de
-etiquetas, 294 filas).** Prerrequisito: subir `spain-france.mp4` (1,4 GB) a Drive.
+**Resultado: AUC 0,584 (viejo) → 0,579 (recalibrado). NO subió.** La calibración
+no era el techo. Baseline viejo: 206 transiciones (111 PASS); recalibrado: 296
+transiciones (108 PASS) — el set cambió porque el ball path cambió la posesión.
+
+**Demostrado con ablación** (leave-one-block-out, mismas 3 etiquetas):
+
+```
+                    VIEJO    RECAL
+TODAS (36 feat)     0,577    0,579     <- sin cambio
+solo geométricas    0,602    0,594     <- sin cambio (dominan, son de PELOTA)
+SIN pelota (17)     0,452    0,530     <- +0,078 REAL (coords ayudan a jugadores)
+```
+
+Lectura: la calibración SÍ mejoró las features de jugadores (0,452→0,530), pero
+el total no se movió porque lo dominan las features de PELOTA, que no mejoraron:
+arreglamos el mapa, no la detección de la pelota (sigue 45%). Sacar features de
+pelota baja el AUC 0,579→0,530 → la pelota aporta ~0,05 pero está capada.
+**El AUC está limitado por la PELOTA.** ⚠️ Fragilidad: n=200-296, UN partido,
+±0,03 = ruido; "calibración descartada" es firme, "ball-limited" es direccional
+(consistente, no probado con un solo partido).
+
+Fix barato probado y DESCARTADO: usar los pies del poseedor para endpoints en vez
+de la pelota (idea de que la homografía no vale para la pelota en el aire) →
+EMPEORÓ (0,579→0,549). Los endpoints caen en bordes de posesión, con la pelota
+cerca del piso; la proyección aérea no los afecta. Revertido.
+
+**Palanca que queda: WASB** (mejor detección de pelota) + más partidos (n frágil).
+Detalle en la memoria `auc-calibracion-no-era-el-techo`. Baseline a batir: 0,58.
 
 # ✅ CALIBRACIÓN ESCALABLE: PnLCalib (21-ago)
 
