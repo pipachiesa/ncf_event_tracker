@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--max-interp", type=int, default=MAX_INTERP,
                     help="gap max entre labels visibles para interpolar (frames CSV)")
+    ap.add_argument("--max-frames", type=int, default=0,
+                    help="0=todo el rango; >0 recorta a los primeros N frames (smoke test)")
     args = ap.parse_args()
 
     lab = {}
@@ -60,6 +62,9 @@ def main():
     if not lab:
         raise SystemExit("labels vacio")
     lo, hi = min(lab), max(lab)
+
+    if args.max_frames:
+        hi = min(hi, lo + args.max_frames - 1)
 
     vis_frames = sorted(f for f, (x, y, v) in lab.items() if v)
 
