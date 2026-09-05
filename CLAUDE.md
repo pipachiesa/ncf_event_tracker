@@ -21,17 +21,173 @@ la triangulación 3D multi-cámara de los demos virales NO aplica. Que la cámar
 siga la pelota no la salva del blur ni de las transiciones donde la cámara se
 atrasa y la pelota queda chica/lejana un momento.
 
-## Estado en una línea (actualizado 26-ago)
+## Estado en una línea (actualizado 5-sep)
 
-**Calibración RESUELTA e integrada** (PnLCalib, `main.py --pitch-model pnlcalib`,
-0,56 m). **Pelota MEDIDA contra ground truth**: bien solo 35% → **45%** con un fix
-de una línea en el Viterbi (enganche 3,6x→0,9x). **El test del AUC ya se hizo: la
-calibración NO era el techo** (0,584→0,579 con coords buenas); la ablación muestra
-que **el AUC está limitado por la PELOTA** (features de jugadores mejoran, las de
-pelota no, porque la pelota sigue 45%). **La única palanca que queda es WASB**
-(detección temporal, techo del detector 54% de frames) + más partidos etiquetados
-(n=296 de un partido es frágil). Dataset de WASB ya corregido; falta reescribir el
-notebook de fine-tune (config del Trainer, QFL). Baseline a batir: **AUC 0,58**.
+**Calibración RESUELTA** (PnLCalib, 0,56 m). **Pelota medida contra GT: 45% acc@100
+en sf, ~40% en brasil.** **El AUC NO estaba limitado por la calibración sino por la
+PELOTA** (medido). **CROSS-MATCH hecho (sf↔brasil): el enfoque GENERALIZA (ROC ~0,59)
+y la calidad de la pelota manda (brasil-within 0,73 vs sf 0,58).** brasil pasó a ser
+el **dataset primario** (broadcast, pelota más clara). **WASB (la palanca de la pelota)
+se intentó a fondo y el primer fine-tune FALLÓ (7%→1%)** por labels ralos/interpolados;
+el cableado funciona pero necesita labels DENSOS que no tenemos. **Decisión PENDIENTE
+(Felipe): A) etiquetar denso y reintentar WASB, o B) parar WASB e ir a más partidos +
+herramienta de revisión.** Recomendado: **B**. Ver la sección grande de abajo.
+Baseline AUC a batir: **0,58 (sf) / 0,73 (brasil)**.
+
+# 📍 SESIÓN 24-ago → 5-sep: cross-match, brasil primario, y la SAGA WASB (leer primero)
+
+Esta sección resume TODO lo hecho después de cerrar la calibración. Es lo más
+actual; las secciones históricas de abajo (mosaico, keypoints, homografía) son
+cómo se llegó a la calibración y ya están resueltas por PnLCalib.
+
+## 1. Revisión de referencias externas + SAHI (24-ago) — descartados
+Ver secciones dedicadas abajo. Resumen: todos los repos que mandó Felipe usan
+detección frame-a-frame (YOLO/RF-DETR); ninguno es temporal. SAHI (slicing) se
+probó end-to-end y falla (re-detecta la marca de penal en los huecos). RF-DETR es
+movimiento lateral. **Conclusión: la única palanca de pelota es detección temporal
+(WASB).**
+
+## 2. Test del AUC: la calibración NO era el techo, es la PELOTA (26-ago)
+Se re-calibró spain-france con pnlcalib (por re-proyección, sin re-track) y se
+re-entrenó. **AUC 0,584 → 0,579: NO subió.** Ablación: las features de jugadores
+mejoraron con coords buenas (0,45→0,53) pero el total no se movió porque lo dominan
+las features de PELOTA, que siguen malas (pelota 45%). **El AUC está capado por la
+pelota.** (Fix barato probado: endpoints con los pies del poseedor en vez de la
+pelota → EMPEORÓ, revertido.) Detalle en `auc-calibracion-no-era-el-techo` (memoria).
+
+## 3. Segundo partido (brasil_noruega) + CROSS-MATCH (30-ago) — EL MEJOR RESULTADO
+Se trackeó brasil_noruega (124 min, 1080p broadcast) con pnlcalib+Viterbi, se
+propusieron eventos y Felipe etiquetó **3 ventanas** (min 15-23, 75-83, 110-118;
+~287 transiciones, 141 PASS). Labels en `events_model/dataset/brasil_noruega_{15_23,
+75_83,110_118}_labeled.csv`. `eval_events.py` cross-match:
+```
+                 cross-match (train->test)     within (leave-one-block-out)
+  sf -> brasil : ROC 0.596                       sf     : ROC 0.579  PR-AUC 0.456
+  brasil -> sf : ROC 0.594                       brasil : ROC 0.726  PR-AUC 0.744
+```
+**(a) GENERALIZA**: cross-match ~0,59 = igual/mejor que sf-within → NO era espejismo
+de un partido; riesgo #1 (no generaliza) descartado. **(b) LA PELOTA MANDA, con
+número**: mismo pipeline, sf (pelota 45%) → 0,58; brasil (pelota clara) → **0,73**.
++0,15, prueba directa de que mejorar la pelota sube el AUC. **DECISIÓN: brasil =
+dataset primario.** ⚠️ pero el target real es footage AMATEUR (como sf o peor);
+brasil es MÁS FÁCIL → usar brasil para desarrollo/techo, mantener sf como reality-check.
+Detalle: memoria `cross-match-brasil`.
+
+### Observaciones de campo de Felipe (etiquetando brasil) — importantes
+- El broadcast se ve mucho mejor PERO **igual toma el punto de penal / puntos blancos
+  antes que la pelota** → el problema de la marca es de APARIENCIA, no resolución.
+- Pases limpios: excelente. **Amontonamiento cerca de la pelota → la pierde** (oclusión).
+- **Cambios de cámara / REPETICIONES → duplica eventos, se confunde.** CLAVE: el
+  target amateur es UNA cámara sin cortes ni repeticiones → ese modo de falla NO
+  existe en producción; es artefacto del broadcast. Si se sigue usando broadcast:
+  shot-boundary detection (módulo aparte).
+- El círculo del overlay iba unos frames adelantado a la pelota → bug de render
+  (interpolación del dibujo), NO de detección; las features usan coords bien indexadas.
+
+## 4. Ball ruler de brasil + la PARADOJA (31-ago)
+Felipe etiquetó `ball_gt/brasil_noruega_ball_labels.csv` (1749 frames, 1125 visibles,
+624 invisibles; negó repeticiones y pausa de hidratación) con `--every 12`. `eval_ball.py`:
+- acc@100 GLOBAL **39,6%** (¡MENOR que sf 45%!), techo detector 48%, precisión 78%.
+- acc@100 CERCA de eventos (±1,5s): 45% vs 36% lejos.
+- **Tamaño de pelota: brasil p50=12px vs sf 8px** (Felipe tenía razón: el zoom la hace
+  más grande, sin lejanas chicas).
+**PARADOJA RESUELTA**: la pelota es más grande/clara en brasil pero el tracking sigue
+~45%, porque el cuello de botella **NO es tamaño/visibilidad sino (1) la MARCA de penal
+(idéntica, la elige al lado de la pelota clara) y (2) el CROWDING** — exactamente lo que
+observó Felipe. **El acc GLOBAL es la métrica equivocada para el producto; medir cerca
+de eventos.** El blacklist tuneado en sf (celda 2m) NO transfiere a brasil (síntoma
+2,2→2,0x): el tuneo de celda es overfit por-clip; el fix durable es temporal (WASB) o el
+residual compensado por homografía. Detalle: memoria `pelota-exactitud-vs-labels`.
+
+## 5. Triage / producto: 0,73 NO alcanza para auto-aceptar (31-ago)
+Con los scores del clasificador en brasil: precision@recall70 = **0,66** (sf: 0,40).
+Pero auto-aceptar tope: aun los MÁS confiables tienen **78% de precisión** (se necesita
+~95% para auto-aceptar sin revisar). **A 0,73 de AUC el producto de auto-aceptado NO
+funciona todavía; no se puede fakear con triage.** Felipe además recordó que los IDs de
+jugador se pierden/mezclan (ReID) — otro blocker de usabilidad, separado de la pelota.
+Refuerza que hace falta MÁS SEÑAL (pelota/WASB o más datos), no solo triage.
+
+## 6. LA SAGA WASB (1-5 sep) — cableado OK, primer fine-tune FALLÓ
+El intento serio de la palanca de pelota. Cronología y hallazgos:
+
+**WASB preentrenado (zero-shot) NO transfiere.** `wasb_soccer_best` sobre nuestro
+footage: sf **0,2%**, brasil **7%** acc@100. Dominio distinto (broadcast de otro
+dataset) + input 512×288 hace que la pelota de 8-12px quede en ~2-3px. → necesita
+fine-tune sí o sí + input mayor resolución.
+
+**El repo (nttcom/WASB-SBDT) tiene el entrenamiento incompleto** (`runners/train_and_test.py`
+con `assert 0`, sin carga de checkpoint). Así que se escribió un loop propio reusando sus
+builders (`build_model`, `build_dataloader`, `build_loss_criteria`) + el checkpoint soccer.
+
+**Datos verificados del modelo/loader** (para el agente nuevo):
+- `model.name=hrnet`, 3 frames in / 3 heatmaps out, input **512×288**, checkpoint bajo
+  `ck['model_state_dict']`, carga **0/0** (perfecto).
+- El dataloader (`build_dataloader(cfg)`) devuelve 4 loaders. Con el config `eval` el
+  **train_loader sale VACÍO** (mete todo en test); se usó `loaders[1]` (test) y se
+  splitó temporalmente 70/30.
+- El batch: `[imgs (B,9,288,512), heatmaps_target (defaultdict), heatmaps? (defaultdict),
+  xy_gt (B,3,2), visis (B,3, bool), img_paths (list)]`. `model(imgs)` → **dict** de
+  heatmaps por escala. Loss factory: `heatmap`/`segmentation` (no `qfl` directo;
+  HeatmapLoss lo usa adentro y necesita config que no compusimos).
+- Los pesos preentrenados: Google Drive id `1pg0MpMtKZ6ziYEr4oyfKYPOO3hjLw94l` (gdown).
+
+**Bugs de `make_wasb_dataset.py` encontrados y arreglados** (todos commiteados):
+falsos negativos (frames no anotados marcados como "sin pelota" → interpolar entre
+labels visibles), indexado 0-based (el loader es 0-based, escribía 1-based), estructura
+plana `frames/<clip>/` (no anidada), `--max-frames` (para no llenar disco).
+
+**SMOKE TEST: PASÓ.** Loop de fine-tune con MSE sobre heatmaps: loss 39,5 → 0,24 en 30
+pasos. **El cableado de WASB funciona end-to-end** (modelo carga, dataloader da targets,
+forward/backward, loss baja).
+
+**FINE-TUNE REAL: FALLÓ.** 8 épocas sobre brasil (3000 frames, dense por interpolación):
+`ANTES (soccer) acc@100 7% → epoch 7: 1%`. **El fine-tune EMPEORÓ el modelo.** train_loss
+baja a 0,014 (overfit) pero val ~1%, dist p50 ~633px. **Causa: el 84% de los labels de
+entrenamiento son INTERPOLADOS sobre gaps de 12 frames (=1s); en 1s la pelota vuela
+metros, la interpolación lineal pone el target donde la pelota NO está → el modelo
+aprende ruido y desaprende lo de soccer.** Los labels de brasil (cada 12) son buenos
+como RULER, **inservibles para ENTRENAR**. (Bug de métrica de val encontrado y arreglado:
+el argmax del heatmap está en 512×288 y `xy_gt` en 1920×1080 → escalar ×1920/W, ×1080/H.)
+
+**Para que WASB funcione hace falta: labels DENSOS y precisos** (cada frame, o gaps ≤3),
+no cada-12-interpolado. Eso es etiquetado manual denso de unos clips cortos. No hay atajo.
+
+### Lecciones de infraestructura Kaggle/Colab (para el agente nuevo)
+- El **Colab del college** viene sin pago (edu), saldo de unidades impredecible; A100
+  quema ~5,3 u/h, T4 ~1 u/h. Se agotó. Para GPU sostenida → **Kaggle (T4×2 gratis,
+  30h/semana)**, pero requiere **verificar teléfono** para habilitar GPU E Internet.
+- Kaggle: el video va como **Dataset** (Add Input), no Drive. `/kaggle/working` tope
+  ~19,5 GB → >~10k PNGs 1080p lo llenan (usar `--max-frames`). Las **sesiones son
+  efímeras** (al cerrar se pierde todo lo no guardado). **Quick Save** persiste sin
+  re-correr; **Save & Run All** re-corre TODO en batch de fondo (lento, puede trabarse).
+- `numpy 2.0`: WASB usa `np.Inf`/`np.NaN` (removidos) → parchear a `np.inf`/`np.nan`.
+
+## 7. Archivos nuevos de esta etapa (en el repo, rama events-model)
+- `data_cleanup/eval_ball.py` — LA REGLA de la pelota (acc@20/50/100 vs ball_gt).
+- `events_model/eval_events.py` — eventos: ROC-AUC + PR-AUC + precision@recall + LOBO.
+- `data_cleanup/reproject_from_homographies.py` — re-proyecta tracking con H de pnlcalib.
+- `data_cleanup/sahi_huecos.py` — SAHI en huecos (DESCARTADO, referencia).
+- `events_model/make_wasb_dataset.py` — labels → dataset WASB (arreglado, --max-frames).
+- `event_generation/wasb_finetune_kaggle.ipynb` — fine-tune WASB (Kaggle, el que falló).
+- `event_generation/wasb_finetune_smoke_kaggle.ipynb` — smoke test (pasó).
+- `event_generation/recalibrate_spain_france_colab.ipynb` — homografías pnlcalib (AUC test).
+- `event_generation/sahi_huecos_colab.ipynb`, `wasb_pretrained_colab.ipynb` — pruebas.
+- Labels GT commiteados: `ball_gt/brasil_noruega_ball_labels.csv` + los 3 `_labeled.csv`.
+
+## 8. Dónde estamos y la decisión abierta
+El proyecto: **generaliza, la pelota es la palanca (con número), y en footage bueno da
+0,66 precision@recall70 — pero no alcanza para auto-aceptar y WASB (el fix) no dio
+resultado en el primer intento por falta de labels densos.** La decisión que Felipe
+tiene que tomar (y que el agente nuevo debería respetar):
+- **A. WASB en serio**: etiquetar denso 3-5 clips cortos de brasil (cada frame,
+  ~500-1000 consecutivos), reintentar el fine-tune. Palanca correcta, más laburo manual,
+  payoff incierto.
+- **B. Parar WASB**: aceptar la pelota como está, ir a más partidos etiquetados (AUC
+  firme, cross-match con 3+ partidos) + construir la herramienta de revisión (autoacepta
+  confiable + cola) y medir el TIEMPO DE REVISIÓN ahorrado (métrica de producto: manual
+  ~90 min → objetivo 20-30). Recomendado.
+El norte del proyecto cambió: **no perseguir tracking perfecto ni eventos 100%
+automáticos, sino una herramienta útil que ahorre tiempo de revisión.**
 
 # ✅ LA PELOTA, MEDIDA DE VERDAD (24-25 ago) — la regla nueva y el fix del Viterbi
 
@@ -1172,41 +1328,40 @@ eventos → si sube claro, escalar al partido.
 
 ---
 
-# Próximos pasos (26-ago)
+# Próximos pasos (5-sep) — para el agente nuevo
 
-El test del AUC ya se hizo (calibración descartada como techo; ver la sección de
-arriba). El foco cambia: **no perseguir tracking perfecto ni eventos 100%
-automáticos, sino una herramienta útil** — autoacepta lo muy confiable, deja el
-resto en una cola de revisión rápida. La métrica de producto: cuánto tiempo tarda
-una persona en corregir un partido (hoy manual ~90 min → objetivo 20-30 de revisión).
+**Norte del proyecto**: no tracking perfecto ni eventos 100% automáticos, sino una
+**herramienta útil** que ahorre tiempo de revisión (autoacepta lo confiable, cola de
+revisión para el resto). Métrica de producto: tiempo de corregir un partido (manual
+~90 min → objetivo 20-30). Estado medido: **generaliza (cross-match ROC 0,59), la
+pelota es la palanca (brasil 0,73 vs sf 0,58), pero a 0,73 el auto-aceptado todavía
+no sirve (precisión tope 78%) y WASB —el fix de la pelota— falló en el 1er intento
+por labels ralos.**
 
-1. **Congelar el sistema de evaluación** ANTES de otro experimento: dos comandos
-   reproducibles (pelota: acc@20/50/100, recall detector vs post-Viterbi, aisladas,
-   huecos, FP en la marca, por tercio/paneo/transición; eventos: ROC-AUC **y
-   PR-AUC**, precision@recall, leave-one-match-out). No volver a tunear sobre los
-   mismos 538 positivos del clip.
-2. **WASB** (techo del detector, 54%): reescribir el notebook (config completa del
-   Trainer, QFL + hard mining, dataloader train activo, split temporal, pesos
-   soccer bien cargados — ⚠️ HOY el notebook NO corre). Medir WASB **preentrenado**
-   antes del fine-tune. A/B: YOLO 15fps vs 30fps vs WASB 15/30fps vs WASB fine-tune.
-   Integrar como **candidatos** (top-K del heatmap → fusión con YOLO → Viterbi), NO
-   como tracker final. Éxito = 45% → 60-65% @100px en validación SEPARADA, precisión
-   ≥85%, menos aisladas. La pelota puede tener rama propia a 30 fps.
-3. **Segundo partido EN PARALELO** (no esperar a WASB): n=296 de un partido es el
-   problema estadístico mayor. Etiquetar PASS/NONE en 3-4 ventanas del partido más
-   DISTINTO (otra cámara/camisetas/estadio) → cross-match real (train sf→test otro,
-   y viceversa). ⚠️ al mejorar la pelota cambian las propuestas: las nuevas NO son
-   negativos automáticos (lección #7).
-4. Clasificador con **features de incertidumbre** (conf de pelota, % observado vs
-   interpolado, hueco alrededor del evento, calidad de homografía, indicador de
-   vuelo). Seguir con HistGradientBoosting; cambiar de modelo no arregla datos.
-5. La marca de penal, solo si WASB sigue fallando ahí: residual temporal
-   compensado por homografía (no re-tunear la celda 2m, está sobreajustada).
-6. Bajo costo ya identificado: SigLIP+UMAP+KMeans para clasificar equipos.
+## LA DECISIÓN ABIERTA (Felipe elige; el agente nuevo debe respetarla)
+- **A. WASB en serio**: etiquetar DENSO (cada frame) 3-5 clips cortos de brasil
+  (~500-1000 frames consecutivos c/u) con `label_ball.py`, reintentar el fine-tune
+  (`wasb_finetune_kaggle.ipynb`, ya cableado y funcionando; el bloqueo fue calidad de
+  labels). Palanca correcta, más laburo manual, payoff incierto. Kaggle (GPU gratis).
+- **B. Parar WASB (RECOMENDADO)**: aceptar la pelota como está y atacar lo que rinde:
+  1. **3er partido etiquetado** (el más distinto posible) → cross-match con 3 partidos
+     = generalización firme (con 2 ya generaliza, con 3 se estima bien).
+  2. **Herramienta de revisión**: triage por confianza (autoacepta alto, cola medio,
+     descarta bajo) + medir el tiempo de revisión real ahorrado. Es el entregable.
+  3. **ReID de jugadores** (los IDs se pierden/mezclan — blocker de usabilidad que la
+     pelota NO arregla): SigLIP/OSNet (memoria `reid-tuning-findings`, techo color ~106
+     ids; para 40-70 estables hace falta embeddings visuales).
+  4. Features de incertidumbre en el clasificador (conf de pelota, % interpolado, hueco
+     alrededor del evento, calidad de homografía). Seguir con HistGradientBoosting.
 
-**Riesgo principal**: gastar semanas puliendo la pelota sobre un clip y descubrir
-que el clasificador no generaliza. Por eso pelota y segundo partido son dos
-frentes del MISMO hito. (Plan detallado: feedback de los agentes, 26-ago.)
+## Reglas de evaluación (YA CONGELADAS, usarlas siempre)
+- Pelota: `data_cleanup/eval_ball.py` (acc@20/50/100 vs `ball_gt/*_ball_labels.csv`).
+  **Medir cerca de eventos, no solo global** (el global engaña, ver §4 arriba).
+- Eventos: `events_model/eval_events.py` (ROC-AUC + PR-AUC + precision@recall + LOBO).
+- brasil = dataset primario; sf = reality-check amateur. No tunear sobre el mismo set.
+
+**Riesgo principal**: gastar semanas en la pelota (WASB) y que no rinda. Ya pasó un
+intento. Por eso B pone el peso en generalización + producto, que es plata más segura.
 
 ## La cadena, hoy
 
