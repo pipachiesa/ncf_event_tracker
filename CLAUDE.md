@@ -21,6 +21,25 @@ la triangulación 3D multi-cámara de los demos virales NO aplica. Que la cámar
 siga la pelota no la salva del blur ni de las transiciones donde la cámara se
 atrasa y la pelota queda chica/lejana un momento.
 
+## Actualización 6-sep — auditoría y alternativa sparse (Codex)
+
+**Leer antes de las conclusiones históricas sobre WASB/aislamiento.**
+- `eval_ball.py` confundía vecinos sin GT con ausencia de detección. Corregido:
+  baseline local SF sigue 242/538 (45% acc@100), pero los 54 casos perdidos por
+  el path son INDETERMINADOS, no aislados comprobados. No está probado que la
+  selección esté agotada ni que WASB sea la única alternativa.
+- `make_wasb_dataset.py` todavía convertía algunos desconocidos en negativos.
+  Ahora requiere etiquetas completas y rechaza interpolación/rangos ralos.
+- Nueva vía `events_model/wasb_sparse.py`: tres imágenes fuente consecutivas,
+  supervisión SOLO central con etiqueta real, sin interpolación. Permite probar
+  fine-tune con las etiquetas ralas existentes; **eficacia todavía no medida**.
+- Auditoría Brasil: 991 etiquetas visibles train / 134 validación. Split temporal
+  con embargo, baseline inicial y conservación del mejor checkpoint.
+- Tests de indexado/máscara/split/evaluador pasaron. Forward/backward HRNet real
+  con frame real y pesos aleatorios pasó (compatibilidad, NO exactitud).
+- No se entrenó un checkpoint nuevo ni se cambió el tracking de producción.
+  Instrucciones y límites: `events_model/WASB_SPARSE.md`.
+
 ## Estado en una línea (actualizado 5-sep)
 
 **Calibración RESUELTA** (PnLCalib, 0,56 m). **Pelota medida contra GT: 45% acc@100

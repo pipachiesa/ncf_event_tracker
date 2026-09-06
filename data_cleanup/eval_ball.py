@@ -63,6 +63,18 @@ def pct(sorted_vals, q):
     return sorted_vals[int(q * (len(sorted_vals) - 1))] if sorted_vals else 0
 
 
+def isolation_status(frame, vis, invis, candidates, near=100.0):
+    """Unknown neighbors cannot establish temporal isolation."""
+    neighbors = [frame + d for d in (-2, -1, 1, 2)]
+    for g in neighbors:
+        if g in vis and any(math.dist(c, vis[g]) <= near
+                            for c in candidates.get(g, [])):
+            return "supported"
+    if all(g in vis or g in invis for g in neighbors):
+        return "isolated"
+    return "unknown"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tracking", required=True)
@@ -75,6 +87,8 @@ def main():
     ball = load_ball(args.tracking)
     cand = load_candidates(args.candidates)
     n = len(vis)
+    if not n:
+        raise SystemExit("No hay etiquetas visibles para evaluar exactitud")
     print(f"GT: {n} frames con pelota visible, {len(invis)} invisibles\n")
 
     # --- exactitud post-Viterbi sobre GT-visibles ---
@@ -107,19 +121,15 @@ def main():
     print(f"  brecha de seleccion (detector - post-Viterbi): {100*det/n - within(100):.0f} pts")
 
     # --- detecciones aisladas entre las que el path perdio ---
-    def near_real(f):
-        for g in (f-2, f-1, f+1, f+2):
-            if g in vis and cand.get(g) and min(
-                math.hypot(cx-vis[g][0], cy-vis[g][1]) for cx, cy in cand[g]) <= args.near:
-                return True
-        return False
     missing_real = [f for f, (gx, gy) in vis.items()
                     if f not in ball and cand.get(f) and
                     min(math.hypot(cx-gx, cy-gy) for cx, cy in cand[f]) <= args.near]
-    iso = sum(1 for f in missing_real if not near_real(f))
+    statuses = [isolation_status(f, vis, invis, cand, args.near)
+                for f in missing_real]
     print(f"\nPELOTA VISTA POR EL DETECTOR PERO PERDIDA POR EL PATH: {len(missing_real)}")
-    print(f"  de esas, AISLADAS (sin pelota real en vecinos +-2): {iso} "
-          f"-> techo real, necesita deteccion temporal (WASB)")
+    print(f"  con apoyo GT en vecinos: {statuses.count('supported')}")
+    print(f"  aisladas verificadas (4 vecinos anotados): {statuses.count('isolated')}")
+    print(f"  indeterminadas (faltan etiquetas vecinas): {statuses.count('unknown')}")
 
     # --- huecos del camino ---
     fs = sorted(ball)

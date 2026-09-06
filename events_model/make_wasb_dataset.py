@@ -9,14 +9,9 @@ donde <video> es el nombre del clip (NO hay nivel extra anidado). El loader arma
 Usa secuencias de 3 frames consecutivos, asi que se extraen TODOS los frames del
 rango (no solo los anotados). El fine-tune parte de wasb_soccer_best.pth.tar.
 
-⚠️ BUG ARREGLADO (25-ago): los labels de Felipe estan cada ~3 frames. La version
-anterior marcaba TODOS los frames intermedios (no anotados) como visible=0, o sea
-"sin pelota". Eran ~1.000 NEGATIVOS FALSOS: la pelota SI esta en esos frames,
-solo que no se anoto. Entrenar WASB con eso le enseña a NO ver la pelota. Ahora,
-para un frame no anotado que cae entre DOS labels visibles con gap <= MAX_INTERP,
-se INTERPOLA la posicion (la pelota es suave en 0,1-0,2 s) y se marca visible.
-Un frame etiquetado explicitamente no-visible, o no bracketeado por dos visibles
-cercanos, queda outside=1 (negativo real / desconocido).
+Solo exporta rangos completamente anotados. El loader XML de WASB convierte
+frames sin anotacion en negativos, por eso los labels ralos se rechazan ANTES
+de extraer imagenes. Para usarlos sin inventar targets: wasb_sparse.py.
 
 Nota: el config del notebook de WASB debe usar frame_dirname="frames",
 anno_dirname="annos" y videos=[<clip>] para que las rutas coincidan.
@@ -28,16 +23,9 @@ Uso:
         --out ~/wasb_ft/soccer --clip spain-france-3min --stride 2
 """
 import argparse
-import bisect
 import csv
 import os
 import cv2
-
-# Gap maximo (en frames CSV) entre dos labels visibles para interpolar los
-# frames intermedios. Los labels estan cada 3, asi que 3 cubre el caso normal;
-# gaps mas grandes suelen ser la pelota entrando/saliendo de vista -> no
-# interpolar (queda outside=1) para no inventar pelota donde no la hay.
-MAX_INTERP = 3
 
 
 def main():
@@ -47,11 +35,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--clip", default="clip1")
     ap.add_argument("--stride", type=int, default=2)
-    ap.add_argument("--max-interp", type=int, default=MAX_INTERP,
-                    help="gap max entre labels visibles para interpolar (frames CSV)")
+    ap.add_argument("--max-interp", type=int, default=0,
+                    help="obsoleto: no se permite interpolar etiquetas de entrenamiento")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="0=todo el rango; >0 recorta a los primeros N frames (smoke test)")
     args = ap.parse_args()
+    if args.stride < 1 or args.max_frames < 0 or args.max_interp != 0:
+        ap.error("stride debe ser positivo; max-frames >=0; interpolacion deshabilitada")
 
     lab = {}
     for r in csv.DictReader(open(args.labels)):
@@ -66,23 +56,15 @@ def main():
     if args.max_frames:
         hi = min(hi, lo + args.max_frames - 1)
 
-    vis_frames = sorted(f for f, (x, y, v) in lab.items() if v)
-
-    def dense_label(f):
-        """La etiqueta anotada de f, o interpolada entre dos labels visibles
-        cercanos, o (None,None,0) si no se puede saber."""
-        if f in lab:
-            return lab[f]
-        i = bisect.bisect_left(vis_frames, f)
-        if i == 0 or i == len(vis_frames):
-            return (None, None, 0)             # fuera del rango anotado
-        a, b = vis_frames[i - 1], vis_frames[i]
-        if b - a > args.max_interp:
-            return (None, None, 0)             # gap grande -> no inventar pelota
-        ax, ay, _ = lab[a]
-        bx, by, _ = lab[b]
-        t = (f - a) / (b - a)
-        return (ax + (bx - ax) * t, ay + (by - ay) * t, 1)
+    # WASB's XML loader treats absent/unknown targets as negative. Do not
+    # manufacture supervision; sparse labels belong in wasb_sparse.py.
+    missing = sum(f not in lab for f in range(lo, hi + 1))
+    if missing:
+        raise SystemExit(
+            f"Exportacion cancelada: {missing} frames sin etiqueta real. "
+            "El loader XML los convierte en negativos falsos. "
+            "Usar wasb_sparse.py (supervision central sin interpolacion) "
+            "o anotar todos los frames del rango.")
 
     fdir = os.path.expanduser(os.path.join(args.out, "frames", args.clip))
     adir = os.path.expanduser(os.path.join(args.out, "annos"))
@@ -91,17 +73,16 @@ def main():
 
     cap = cv2.VideoCapture(os.path.expanduser(args.video))
     tracks = []   # (fid, x, y, visible)
-    n_interp = 0
     for csv_frame in range(lo, hi + 1):
         cap.set(cv2.CAP_PROP_POS_FRAMES, (csv_frame - 1) * args.stride)
         ok, fr = cap.read()
         if not ok:
-            break
+            cap.release()
+            raise RuntimeError(f"No se pudo leer frame {csv_frame}")
         fid = csv_frame - lo                   # 0-indexed (loader WASB es 0-based)
-        cv2.imwrite(os.path.join(fdir, f"{fid:05d}.png"), fr)
-        x, y, v = dense_label(csv_frame)
-        if v and csv_frame not in lab:
-            n_interp += 1
+        if not cv2.imwrite(os.path.join(fdir, f"{fid:05d}.png"), fr):
+            raise RuntimeError("No se pudo escribir imagen")
+        x, y, v = lab[csv_frame]
         tracks.append((fid, x, y, v))
     cap.release()
 
@@ -122,7 +103,7 @@ def main():
 
     vis = sum(1 for _f, _x, _y, v in tracks if v)
     print(f"{len(tracks)} frames extraidos ({tracks[0][0]:05d}.png..{tracks[-1][0]:05d}.png), "
-          f"{vis} con pelota ({n_interp} interpolados, {vis - n_interp} anotados), en {args.out}")
+          f"{vis} con pelota (todos anotados), en {args.out}")
     print(f"config WASB: root_dir={os.path.expanduser(args.out)}  videos=['{args.clip}']  "
           f"frame_dirname='frames'  anno_dirname='annos'")
 
