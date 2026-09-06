@@ -1,0 +1,121 @@
+diff --git a/inference.py b/inference.py
+index d405638..000ff4d 100644
+--- a/inference.py
++++ b/inference.py
+@@ -11,7 +11,10 @@ import torch
+ import numpy as np
+ import random
+ from torch.utils.data import DataLoader
+-import wandb
++try:
++    import wandb  # only needed for training/evaluation runs
++except ImportError:
++    wandb = None
+ import sys
+ 
+ 
+@@ -94,7 +97,13 @@ def main(args):
+ 
+                 
+     # Model
+-    model = TDEEDModel(args=args)
++    if torch.cuda.is_available():
++        device = 'cuda'
++    elif torch.backends.mps.is_available():
++        device = 'mps'
++    else:
++        device = 'cpu'
++    model = TDEEDModel(device=device, args=args)
+ 
+     #If pretrain -> 2 prediction heads
+     if args.pretrain != None:
+@@ -104,7 +113,8 @@ def main(args):
+ 
+     print('START INFERENCE')
+     model.load(torch.load(os.path.join(
+-        os.getcwd(), 'checkpoints', args.model.split('_')[0], args.model, 'checkpoint_best.pt')))
++        os.getcwd(), 'checkpoints', args.model.split('_')[0], args.model, 'checkpoint_best.pt'),
++        map_location='cpu'))
+ 
+     stride = STRIDE
+     if args.dataset == 'soccernet':
+@@ -117,9 +127,11 @@ def main(args):
+         stride = stride, dataset = args.dataset, size = (args.frame_width, args.frame_height)
+     )
+ 
++    # num_workers=0: with an IterableDataset every extra worker replays the
++    # whole video, duplicating work
+     inference_loader = DataLoader(
+         inference_dataset, batch_size = args.batch_size,
+-        shuffle = False, num_workers = args.num_workers,
++        shuffle = False, num_workers = 0,
+         pin_memory = True, drop_last = False)
+ 
+     inference(model, inference_loader, classes, threshold = args.inference_threshold)
+diff --git a/model/model.py b/model/model.py
+index 1f7d754..975aa1e 100644
+--- a/model/model.py
++++ b/model/model.py
+@@ -167,8 +167,9 @@ class TDEEDModel(BaseRGBModel):
+             return x
+         
+         def update_pred_head(self, num_classes = [1, 1]):
++            device = next(self.parameters()).device
+             self._pred_fine = FC2Layers(self._feat_dim, num_classes)
+-            self._pred_fine = self._pred_fine.cuda()
++            self._pred_fine = self._pred_fine.to(device)
+             self._double_head = True
+ 
+         def print_stats(self):
+@@ -343,6 +344,7 @@ class TDEEDModel(BaseRGBModel):
+ 
+         self._model.eval()
+         with torch.no_grad():
++            use_amp = use_amp and torch.cuda.is_available()
+             with torch.cuda.amp.autocast() if use_amp else nullcontext():
+                 pred, y = self._model(seq, inference=True, augment_inference = augment_inference)
+             if isinstance(pred, dict):
+diff --git a/util/eval.py b/util/eval.py
+index 632393e..23f7104 100644
+--- a/util/eval.py
++++ b/util/eval.py
+@@ -10,9 +10,15 @@ from collections import defaultdict
+ import copy
+ from tabulate import tabulate
+ import os
+-from SoccerNet.Evaluation.ActionSpotting import average_mAP
++try:
++    # SoccerNet is only needed for the evaluation functions (valMAP_SN,
++    # evaluate_SNB); inference works without it.
++    from SoccerNet.Evaluation.ActionSpotting import average_mAP
++    from SoccerNet.Evaluation.utils import LoadJsonFromZip
++except ImportError:
++    average_mAP = None
++    LoadJsonFromZip = None
+ import zipfile
+-from SoccerNet.Evaluation.utils import LoadJsonFromZip
+ import json
+ import glob
+ 
+@@ -454,6 +460,10 @@ def evaluate(model, dataset, split, classes, save_pred=None, printed = True,
+ 
+ def valMAP_SN(labels, preds, framerate = 25, metric = "tight", version = 2):
+ 
++    if average_mAP is None:
++        raise ImportError(
++            'SoccerNet is required for evaluation: pip install SoccerNet')
++
+     targets_numpy = list()
+     detections_numpy = list()
+     closests_numpy = list()
+@@ -529,6 +539,10 @@ def evaluate_SNB(label_path, pred_path, split = 'test'):
+ def aux_evaluate(SoccerNet_path, Predictions_path, list_games, prediction_file="results_spotting.json", version=2,
+             framerate=2, metric="loose", label_files="Labels-v2.json", num_classes=17, dataset="SoccerNet"):
+ 
++    if average_mAP is None:
++        raise ImportError(
++            'SoccerNet is required for evaluation: pip install SoccerNet')
++
+     targets_numpy = list()
+     detections_numpy = list()
+     closests_numpy = list()

@@ -3,6 +3,13 @@ from lib.player import Player
 from lib.ball import Ball
 from lib.event_generator import EventGenerator, POSSESSION_RADIUS_M
 import csv
+import json
+import os
+from collections import Counter
+
+# Frame rate assumed for raw tracking CSVs written without a .meta.json sidecar
+# (every CSV produced before --frame-stride existed).
+DEFAULT_RAW_FPS = 24
 
 class Match():
     def __init__(self):
@@ -13,6 +20,7 @@ class Match():
         self.source = None
         self.file_path = None
         self.file_name = None
+        self.fps = DEFAULT_RAW_FPS
         # Lazily-built {frame_number: [(player, frame_obj), ...]} index so
         # ``frame()`` only touches players present in that frame instead of
         # scanning all (often thousands of) tracked objects every call.
@@ -78,6 +86,24 @@ class Match():
         self.file_name = file_name
         path = file_path + file_name
         self.source = "raw"
+
+        # Frame numbers in the CSV are always consecutive, but with a tracking
+        # ``--frame-stride`` they tick at fps/stride rather than the video's fps.
+        # main.py records the real rate in a sidecar; without it every timestamp
+        # would be wrong by exactly the stride factor.
+        self.fps = DEFAULT_RAW_FPS
+        meta_path = os.path.join(file_path, file_name.rsplit(".", 1)[0] + ".meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path) as handle:
+                    meta = json.load(handle)
+                self.fps = float(meta.get("effective_fps") or DEFAULT_RAW_FPS)
+                if self.fps != DEFAULT_RAW_FPS:
+                    print(f"fps efectivo desde el sidecar: {self.fps:g} "
+                          f"(frame-stride {meta.get('frame_stride', 1)}).")
+            except Exception as exc:
+                print(f"No pude leer {meta_path} ({exc}); asumo {DEFAULT_RAW_FPS} fps.")
+
         frames = []
         with open(path, "r") as file:
             for line in file:
@@ -85,13 +111,17 @@ class Match():
         frames = frames[1:]
         
         players = {}
+        # The team classifier labels each frame independently and is noisy
+        # (many tracks flip team mid-track), so a player's team is decided by
+        # majority vote over all their frames -- never by any single frame.
+        team_votes = {}
         for frame in frames:
             frame_number = int(frame[0])
             obj = frame[1]
 
             frame_data = {
                 "frame" : frame_number,
-                "time" : frame_number / 24
+                "time" : frame_number / self.fps
             }
 
             if frame[8] == "0" or frame[9] == "0":
@@ -117,14 +147,17 @@ class Match():
                         "id" : player_id,
                         "name" : "Player " + str(player_id),
                     })
-                    
+                    team_votes[str(player_id)] = Counter()
+
                 player = players[str(player_id)]
                 player.source = "raw"
                 player.add_frame(frame_data)
+                team_votes[str(player_id)][team] += 1
 
         self.players = []
         for player_id in players:
             player = players[player_id]
+            player.team = team_votes[player_id].most_common(1)[0][0]
             self.players.append(player)
 
     def player(self, player_id):
@@ -171,11 +204,16 @@ class Match():
         return new_player
     
     def _build_player_frame_index(self):
-        """Index every player's frames by frame number (built once, on demand)."""
+        """Index every player's frames by frame number (built once, on demand).
+
+        Frame numbers are cast to int: the raw importer stores them as ints
+        but the Metrica importer keeps the CSV strings, and a str-keyed index
+        never matches the int lookups in ``frame()``.
+        """
         index = {}
         for player in self.players:
             for fr in player.frames:
-                index.setdefault(fr.frame, []).append((player, fr))
+                index.setdefault(int(fr.frame), []).append((player, fr))
         self._players_by_frame = index
 
     def frame(self, frame_number):

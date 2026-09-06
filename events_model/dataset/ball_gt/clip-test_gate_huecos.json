@@ -1,0 +1,248 @@
+{
+  "video": "spain-france-test3min.mp4",
+  "frame_stride": 2,
+  "sistema": "cancha 105x68 (pitch_config.py), CSV tracking_recal",
+  "que_es": "anotacion de Felipe: de 24 huecos donde el gate de continuidad descarto un candidato de juego, cuales eran pelota real. 10 de 24 (42%) lo eran -> el gate pierde pelota real recuperable.",
+  "anotaciones": [
+    {
+      "panel": 1,
+      "frame": 6,
+      "es_pelota": true,
+      "img_x": 1420.1,
+      "img_y": 525.2,
+      "pitch_x_m": 37.9,
+      "pitch_y_m": 33.3,
+      "conf": 0.467
+    },
+    {
+      "panel": 2,
+      "frame": 97,
+      "es_pelota": true,
+      "img_x": 743.2,
+      "img_y": 539.6,
+      "pitch_x_m": 13.8,
+      "pitch_y_m": 54.9,
+      "conf": 0.231
+    },
+    {
+      "panel": 3,
+      "frame": 136,
+      "es_pelota": false,
+      "img_x": 1085.2,
+      "img_y": 448.3,
+      "pitch_x_m": 48.3,
+      "pitch_y_m": 30.8,
+      "conf": 0.134
+    },
+    {
+      "panel": 4,
+      "frame": 610,
+      "es_pelota": false,
+      "img_x": 608.4,
+      "img_y": 246.2,
+      "pitch_x_m": 10.5,
+      "pitch_y_m": 1.3,
+      "conf": 0.141
+    },
+    {
+      "panel": 5,
+      "frame": 708,
+      "es_pelota": false,
+      "img_x": 656.7,
+      "img_y": 185.8,
+      "pitch_x_m": 10.8,
+      "pitch_y_m": 2.1,
+      "conf": 0.114
+    },
+    {
+      "panel": 6,
+      "frame": 810,
+      "es_pelota": true,
+      "img_x": 1073.7,
+      "img_y": 832.7,
+      "pitch_x_m": 38.7,
+      "pitch_y_m": 64.9,
+      "conf": 0.584
+    },
+    {
+      "panel": 7,
+      "frame": 990,
+      "es_pelota": true,
+      "img_x": 991.8,
+      "img_y": 204.1,
+      "pitch_x_m": 28.1,
+      "pitch_y_m": 4.4,
+      "conf": 0.362
+    },
+    {
+      "panel": 8,
+      "frame": 1077,
+      "es_pelota": true,
+      "img_x": 693.7,
+      "img_y": 263.9,
+      "pitch_x_m": 7.7,
+      "pitch_y_m": 21.5,
+      "conf": 0.498
+    },
+    {
+      "panel": 9,
+      "frame": 1203,
+      "es_pelota": false,
+      "img_x": 578.2,
+      "img_y": 215.8,
+      "pitch_x_m": 10.7,
+      "pitch_y_m": 2.1,
+      "conf": 0.178
+    },
+    {
+      "panel": 10,
+      "frame": 1251,
+      "es_pelota": true,
+      "img_x": 1809.6,
+      "img_y": 360.2,
+      "pitch_x_m": 75.8,
+      "pitch_y_m": 16.9,
+      "conf": 0.37
+    },
+    {
+      "panel": 11,
+      "frame": 1291,
+      "es_pelota": true,
+      "img_x": 1670.3,
+      "img_y": 487.3,
+      "pitch_x_m": 68.8,
+      "pitch_y_m": 38.1,
+      "conf": 0.262
+    },
+    {
+      "panel": 12,
+      "frame": 1338,
+      "es_pelota": false,
+      "img_x": 292.9,
+      "img_y": 205.2,
+      "pitch_x_m": 10.7,
+      "pitch_y_m": 1.8,
+      "conf": 0.396
+    },
+    {
+      "panel": 13,
+      "frame": 1403,
+      "es_pelota": true,
+      "img_x": 1649.4,
+      "img_y": 584.3,
+      "pitch_x_m": 62.9,
+      "pitch_y_m": 48.6,
+      "conf": 0.137
+    },
+    {
+      "panel": 14,
+      "frame": 1625,
+      "es_pelota": false,
+      "img_x": 452.2,
+      "img_y": 229.2,
+      "pitch_x_m": 0.8,
+      "pitch_y_m": 7.9,
+      "conf": 0.336
+    },
+    {
+      "panel": 15,
+      "frame": 1705,
+      "es_pelota": false,
+      "img_x": 615.7,
+      "img_y": 431.4,
+      "pitch_x_m": 18.1,
+      "pitch_y_m": 45.3,
+      "conf": 0.423
+    },
+    {
+      "panel": 16,
+      "frame": 1767,
+      "es_pelota": false,
+      "img_x": 173.8,
+      "img_y": 450.3,
+      "pitch_x_m": 42.0,
+      "pitch_y_m": 45.6,
+      "conf": 0.417
+    },
+    {
+      "panel": 17,
+      "frame": 1846,
+      "es_pelota": false,
+      "img_x": 1374.5,
+      "img_y": 218.1,
+      "pitch_x_m": 30.8,
+      "pitch_y_m": 2.7,
+      "conf": 0.275
+    },
+    {
+      "panel": 18,
+      "frame": 2094,
+      "es_pelota": false,
+      "img_x": 774.1,
+      "img_y": 174.9,
+      "pitch_x_m": 10.9,
+      "pitch_y_m": 2.3,
+      "conf": 0.315
+    },
+    {
+      "panel": 19,
+      "frame": 2119,
+      "es_pelota": false,
+      "img_x": 774.5,
+      "img_y": 177.4,
+      "pitch_x_m": 10.9,
+      "pitch_y_m": 2.1,
+      "conf": 0.125
+    },
+    {
+      "panel": 20,
+      "frame": 2287,
+      "es_pelota": true,
+      "img_x": 1480.0,
+      "img_y": 307.0,
+      "pitch_x_m": 58.9,
+      "pitch_y_m": 12.1,
+      "conf": 0.361
+    },
+    {
+      "panel": 21,
+      "frame": 2338,
+      "es_pelota": false,
+      "img_x": 148.6,
+      "img_y": 393.0,
+      "pitch_x_m": 61.0,
+      "pitch_y_m": 62.5,
+      "conf": 0.447
+    },
+    {
+      "panel": 22,
+      "frame": 2414,
+      "es_pelota": false,
+      "img_x": 1005.9,
+      "img_y": 91.8,
+      "pitch_x_m": 0.6,
+      "pitch_y_m": 24.6,
+      "conf": 0.614
+    },
+    {
+      "panel": 23,
+      "frame": 2515,
+      "es_pelota": true,
+      "img_x": 1030.3,
+      "img_y": 542.4,
+      "pitch_x_m": 20.3,
+      "pitch_y_m": 50.4,
+      "conf": 0.634
+    },
+    {
+      "panel": 24,
+      "frame": 2656,
+      "es_pelota": false,
+      "img_x": 701.5,
+      "img_y": 653.0,
+      "pitch_x_m": 25.0,
+      "pitch_y_m": 60.4,
+      "conf": 0.233
+    }
+  ]
+}

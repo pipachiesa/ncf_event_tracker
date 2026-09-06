@@ -36,6 +36,7 @@ Ball detection notes:
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -111,7 +112,118 @@ PITCH_MODEL_FILE = "yolo-football-pitch-detection.pt"
 # Minimum keypoint confidence to use a landmark in the homography, and minimum
 # number of confident landmarks needed to solve one.
 DEFAULT_PITCH_CONF = 0.5
-MIN_HOMOGRAPHY_POINTS = 4
+# MEDIDO (spain-france, 89.027 frames): con el minimo de 4 puntos, en el 6,4% de
+# los frames TODO el plantel salta mas de 1 m de golpe, y en el 1,7% mas de
+# 10 m. El 93,6% de esos saltos cae en frames multiplo de ``homography_every``,
+# o sea justo cuando se re-estima la transformacion -- no son los jugadores
+# moviendose, es el sistema de coordenadas. Cuatro puntos son el minimo EXACTO
+# para resolver una homografia: no sobra ninguno, asi que el error de
+# reproyeccion es cero por construccion y es imposible saber si la solucion es
+# buena. Con 6 hay redundancia y el error se vuelve medible.
+MIN_HOMOGRAPHY_POINTS = 6
+# Error de reproyeccion maximo tolerado (cm): se proyectan los propios keypoints
+# y se comparan con su posicion conocida en la cancha.
+MAX_REPROJECTION_CM = 300.0
+# Los keypoints tienen que estar REPARTIDOS. Cuatro puntos amontonados en una
+# esquina resuelven una homografia perfecta localmente y disparatada en el resto
+# del campo, que es de donde salen los errores de 25 m. Se exige que la caja que
+# los contiene cubra algo de la imagen y que no esten casi alineados.
+MIN_KEYPOINT_SPREAD = 0.15   # fraccion del ancho/alto de imagen
+MIN_KEYPOINT_ASPECT = 0.08   # razon entre los dos ejes principales
+# ⚠️ Los dos de arriba miden el spread EN LA IMAGEN, y eso NO alcanza.
+# MEDIDO con check_pitch_keypoints.py: en 3 de 4 frames muestreados los unicos
+# keypoints confiables eran los indices 0,1,2,6,7,8,9,10,11,12 -- TODOS del area
+# de penal izquierda, o sea x ∈ {0, 550, 1100, 2015} cm: un cluster de 20 m
+# sobre una cancha de 120. En la IMAGEN ocupaban de x=126 a x=888 px, asi que
+# pasaban el filtro sin problema. El error de reproyeccion daba 36-93 cm
+# (excelente) porque el ajuste es bueno CERCA de esos puntos; despues extrapola
+# al resto de la pantalla y se va a cientos de metros: las esquinas de la imagen
+# proyectaban a (-17768,-14706) y (2584, 62716) cm.
+# La homografia hay que anclarla a puntos repartidos por la CANCHA, no por la
+# pantalla.
+MIN_KEYPOINT_PITCH_X_CM = 3000.0   # 30 m de los 120 de largo
+MIN_KEYPOINT_PITCH_Y_CM = 1500.0   # 15 m de los 70 de ancho
+
+# --- ACUMULACION TEMPORAL DE KEYPOINTS ---
+# MEDIDO con el barrido de umbral: bajar `pitch-conf` de 0,5 a 0,1 NO agrega
+# cancha. En 3 de 4 frames muestreados el span se queda en 20,1 m aunque entren
+# mas keypoints: la camara simplemente no muestra mas campo que ese. En cambio
+# el frame 1, que alcanza a ver el circulo central, llega a 49 m con 36 cm de
+# error de reproyeccion.
+#
+# O sea: la informacion para anclar la homografia EXISTE, pero esta repartida en
+# el TIEMPO, no disponible en un frame solo. La camara panea y va mostrando
+# distintas partes de la cancha.
+#
+# Solucion: guardar los keypoints de los ultimos refrescos y arrastrarlos hasta
+# el frame actual compensando el movimiento de camara (estimado con el
+# desplazamiento mediano de los JUGADORES en pantalla, que ya tenemos trackeados
+# -- se mueven cada uno para su lado, asi que la mediana es el movimiento comun,
+# o sea la camara). Con eso se resuelve desde un conjunto que cubre mucha mas
+# cancha que cualquier frame individual.
+#
+# ⚠️ LA VENTANA DE 5 s (15 refrescos) NO SIRVIO, y el numero de abajo sale de
+# MEDIR, no de estimar. La primera version uso 15 y dio:
+#
+#   Keypoints acumulados al final: 150 puntos cubriendo 20 x 56 m
+#   Homografia: 29 aceptadas, 486 descartadas por calidad (94.6% rechazo)
+#
+# 150 puntos / 15 refrescos = 10 por refresco: quince copias del MISMO parche.
+# El span se mide sobre coordenadas de CANCHA, que son etiquetas fijas del
+# vertice detectado, asi que solo crece si el modelo ve vertices DISTINTOS. A
+# 1,25 px de paneo por refresco, en 5 s la camara se movio 19 px y ve los
+# mismos diez. El arrastre puede estar perfecto y no cambia nada.
+#
+# MEDIDO con check_keypoint_coverage.py sobre el clip (techo por ventana, o sea
+# la union de vertices detectados, independiente de la compensacion del paneo):
+#
+#   ventana    span x p50   % de ventanas >= 30 m
+#     5 s         20,1 m           22%
+#    15 s         20,1 m           35%
+#    30 s         50,8 m           59%
+#    60 s         50,8 m           84%
+#   120 s         50,8 m          100%
+#   clip entero   69,2 m
+#
+# 60 s es donde la ventana empieza a servir de verdad. El clip entero llega a
+# 69,2 m con 17 vertices distintos de 32: ese es el techo de este material.
+KEYPOINT_BUFFER_REFRESHES = 180   # 60 s a 3 refrescos por segundo
+# Guarda ANTI-CATASTROFE, no control de continuidad. Ver la advertencia:
+#
+# ⚠️ UNA VERSION ANTERIOR PUSO ESTO EN 250 cm Y ROMPIO TODO. Comparaba a donde
+# proyectan LOS MISMOS PIXELES con la transformacion vieja y la nueva, y
+# rechazaba la nueva si el resultado difería. Pero cuando la camara PANEA, el
+# mismo pixel corresponde a otro punto del mundo: la transformacion TIENE que
+# cambiar. El filtro castigaba el comportamiento correcto. MEDIDO en el clip de
+# 3 min: 19 homografias aceptadas, 84 descartadas por calidad y 437 por "salto"
+# -- 96,5% de rechazo, o sea el clip entero corriendo con un mapa calculado al
+# principio y CONGELADO. Un mapa congelado no puede saltar, asi que
+# `check_homography.py` daba 0,33% (excelente) mientras el arquero proyectaba a
+# 39 m de su arco. Optimizar la metrica de estabilidad premia justamente el
+# fallo. Estabilidad y CALIBRACION son cosas distintas: medir las dos.
+#
+# Este umbral queda solo para descartar soluciones absurdas (decenas de metros),
+# que ya deberian caer antes por spread y error de reproyeccion.
+MAX_HOMOGRAPHY_JUMP_CM = 1500.0
+
+# --- SUAVIZADO TEMPORAL DE LA HOMOGRAFIA ---
+# MEDIDO: los filtros de calidad (6 puntos, spread, error de reproyeccion) NO
+# alcanzan -- frames con salto > 1 m 9,12% -> 8,71%, casi nada. El temblor es
+# inherente a re-estimar la transformacion desde cero en cada refresco: los
+# keypoints tienen un par de pixeles de ruido y cerca del horizonte eso son
+# metros de cancha. Rechazar soluciones tampoco sirve (congela el mapa y arruina
+# la calibracion, ver MAX_HOMOGRAPHY_JUMP_CM).
+#
+# La cámara se mueve de forma CONTINUA, asi que la transformacion correcta varia
+# suave y el ruido es de alta frecuencia: un promedio movil lo corta sin
+# congelar nada. En vez de promediar matrices (numericamente feo) se promedian
+# las POSICIONES DE CANCHA a las que proyectan cuatro puntos fijos de la imagen,
+# y se reconstruye la transformacion desde ahi.
+#
+# Con alpha 0.35 la ventana efectiva son ~6 refrescos = 30 frames = 2 s. El
+# paneo medido es de 0,25 px/frame, o sea ~7 px de retraso: despreciable frente
+# a los metros de ruido que elimina.
+HOMOGRAPHY_SMOOTH_ALPHA = 0.35
 # Recompute the homography every N frames (the camera pans smoothly, so we reuse
 # the last transform in between to avoid a keypoint pass on every frame).
 DEFAULT_HOMOGRAPHY_EVERY = 5
@@ -124,7 +236,77 @@ DEFAULT_PITCH_IMGSZ = 1280
 # Linearly interpolate ball position across detection gaps no longer than this
 # many frames (longer gaps stay empty). Prevents possession from resetting on
 # every missed detection.
-BALL_INTERP_MAX_GAP = 15
+# Raised from 15 once the continuity gate started rejecting bad detections:
+# the gate trades coverage for trustworthiness (ball presence 87% -> 74%), and
+# interpolation is the safe way to buy that coverage back because a linear fill
+# is SMOOTH and cannot reintroduce teleports. Measured on spain-france at
+# stride 2 (so the effective gap is half this): ball presence 74.4% -> 90.1%,
+# passes 478 -> 594, set pieces 131 -> 125 (slightly better, not worse).
+BALL_INTERP_MAX_GAP = 50
+
+# How many ball candidates per frame to keep for the global trajectory solver
+# (ball_viterbi.py). The greedy in-loop gate keeps one; these are written to a
+# sidecar so the whole path can be re-optimised offline.
+BALL_CANDIDATES_PER_FRAME = 4
+
+# Ball-candidate continuity (see ``_pick_ball``). A powerful shot peaks around
+# 35 m/s; above that no real ball is moving, so a candidate that far from the
+# last known position is a different white object (penalty spot, line, crowd).
+MAX_BALL_SPEED_MS = 40.0
+# The gate compares distances in PITCH METRES (see _pick_ball), so no pixel
+# scale and no slack term are involved. Two earlier attempts failed here:
+# a 120 px "jitter slack" was ~6.6 m of pitch and by itself licensed ~95 m/s
+# jumps (impossible moves only fell 26.3% -> 17.6%), and gating in pixel space
+# stalled at 12.1% because perspective makes a pixel worth far more metres at
+# the far touchline. Sweep on psg-bayern in pitch space: 40 m/s keeps ~57% of
+# detections at ~2% impossible; 30 m/s reaches 0% but costs 8 more points of
+# coverage, which is not worth it (interpolate_ball bridges short gaps anyway).
+DEFAULT_TRACK_FPS = 15.0    # only a fallback; the real effective fps is passed in
+
+# --- Deteccion de pelota por RECORTE de alta resolucion ---
+# A 1080p la pelota mide ~9 px (medido: mediana de las cajas detectadas), justo
+# en el limite de lo que YOLO resuelve. Escalar el frame entero a mayor imgsz
+# cuesta cuadratico (imgsz 1920 = 2.25x), pero la pelota esta SIEMPRE en una
+# region chica y predecible. Recortando esa ventana a resolucion NATIVA se
+# consigue la densidad de pixeles de un frame gigante al precio de una
+# inferencia de 640 -- que es como lo resuelven los sistemas comerciales.
+# --- HISTORIAL: el veto de "enganche a objeto quieto" fue PROBADO Y QUITADO ---
+# Durante meses el detector parecia engancharse a objetos blancos e inmoviles
+# (la marca de penal sobre todo). Se probaron CUATRO vetos, todos fallidos:
+#   1. Geometrico: vetar sobre la marca Y sin moverse. El enganche EMPIEZA con
+#      un salto desde la pelota real, y ese primer frame pasaba.
+#   2. Geometrico por frames consecutivos sobre la marca (radio 1,2 m). Nunca
+#      disparo: los enganches caen a 3,5-4,5 m de la marca NOMINAL.
+#   3. Lista negra de celdas sobre-visitadas (`ball_unpin.py`). Bajo los frames
+#      "clavados" 23,5%->3,8% pero la pelota cerca del penal quedo en 4,24%.
+#   4. Veto por frame de TODA racha estatica. Clavados a 0,0% y la metrica del
+#      sintoma SIN CAMBIO -- lo que rompio el caso.
+# LA CAUSA ERA LA HOMOGRAFIA, no la pelota: la marca no estaba quieta en
+# coordenadas de cancha porque la cancha se movia debajo de ella (ver
+# MIN_HOMOGRAPHY_POINTS). OJO: llegue a escribir aca que "con la homografia
+# arreglada la pelota a <4 m de una marca de penal paso de 5,20% a 0,00%". Ese
+# 0,00% NO prueba nada: el radio de 4 m es una metrica ciega, los falsos
+# positivos caen a 6-14 m de la marca nominal. La metrica que sirve es la
+# fraccion de frames con la pelota DENTRO del area de penal (58,6% medido
+# contra 19,6% esperado). Ver CLAUDE.md.
+# El `StaticGuard` (soltar el ancla de continuidad tras N frames quieto) se
+# implemento y se MIDIO sobre el clip ya arreglado: no aporta nada al sintoma
+# (0,00% con y sin el) y ADEMAS mete teletransportes, porque al soltar el ancla
+# el frame siguiente re-adquiere por confianza sin limite de distancia --
+# movimientos imposibles 2,26% -> 4,26% y p99 de velocidad 37,8 -> 704 m/s en
+# 103 sueltas. Por eso NO esta. No re-agregarlo sin volver a medir el p99.
+#
+# Margen (fraccion del campo) fuera del cual un candidato a pelota se descarta
+# de entrada. La pelota sale del campo de verdad (lateral, corner), asi que el
+# margen es generoso; lo que se corta son las botellas y las pelotas de
+# calentamiento del costado. MEDIDO: 7,0% de los frames con pelota del clip
+# caen fuera de los limites. Descartar en la SELECCION es estrictamente mejor
+# que limpiar despues (clean_offpitch.py): aca todavia hay otro candidato al
+# que recurrir, despues solo queda borrar el frame.
+BALL_OFFPITCH_MARGIN = 0.04
+
+BALL_CROP_SIZE = 640        # lado del recorte en pixeles nativos
+BALL_CROP_CONF_SCALE = 1.0  # el recorte no cambia el umbral, solo la resolucion
 
 # ByteTrack keeps a "lost" player track alive for this many frames before
 # dropping it; a longer buffer reuses the same id across occlusions/missed
@@ -137,13 +319,18 @@ DEFAULT_LOST_TRACK_BUFFER = 150
 DEFAULT_MIN_TRACK_FRAMES = 12
 
 # COCO class ids produced by the stock yolov8 weights.
+# Equipo reservado para arqueros: ni Home (0) ni Away (1). Aguas abajo se los
+# puede tratar aparte en vez de contar pases/perdidas contra un equipo inventado.
+GOALKEEPER_TEAM_ID = 2
+
 COCO_PERSON = 0
 COCO_SPORTS_BALL = 32
 
 # Standard pitch dimensions (centimetres) used to scale normalised image-space
 # coordinates. Matches the dimensions assumed by ``lib.pitch`` for "raw" data.
-PITCH_LENGTH_CM = 12000.0
-PITCH_WIDTH_CM = 7000.0
+# Ver data_cleanup/pitch_config.py: la config de ``sports`` no describe una
+# cancha reglamentaria (area de penal 22% mas profunda, cancha de 120x70).
+from pitch_config import PITCH_L_CM as PITCH_LENGTH_CM, PITCH_W_CM as PITCH_WIDTH_CM
 
 # On frames with few/poor pitch keypoints the homography extrapolates wildly and
 # sends detections far off the pitch. These margins (fractions of pitch size)
@@ -201,34 +388,224 @@ def resolve_pitch_model_path(spec):
         return None
 
 
-def build_pitch_transformer(pitch_result, min_conf=DEFAULT_PITCH_CONF,
-                            min_points=MIN_HOMOGRAPHY_POINTS):
-    """Build an image->pitch ``ViewTransformer`` from detected pitch keypoints.
+def extract_keypoints(pitch_result, min_conf=DEFAULT_PITCH_CONF):
+    """Keypoints confiables de un frame: ``(indices, img_pts)`` o None.
 
-    Returns the transformer, or None when too few confident landmarks were
-    found to solve a homography (caller then reuses the last good transform).
+    Devuelve el INDICE del vertice, no su coordenada de cancha, porque el
+    buffer indexa por vertice para no acumular duplicados (ver KeypointBuffer).
     """
     import supervision as sv
-    try:
-        from sports.configs.soccer import SoccerPitchConfiguration
-        from sports.common.view import ViewTransformer
-    except Exception:
-        return None
 
     key_points = sv.KeyPoints.from_ultralytics(pitch_result)
     if key_points.xy is None or len(key_points.xy) == 0 or key_points.confidence is None:
         return None
     conf = key_points.confidence[0]
     mask = conf > min_conf
-    if int(mask.sum()) < min_points:
+    if int(mask.sum()) < 4:
         return None
+    return (np.where(mask)[0], key_points.xy[0][mask].astype(np.float32))
 
-    frame_pts = key_points.xy[0][mask].astype(np.float32)
-    pitch_pts = np.array(SoccerPitchConfiguration().vertices)[mask].astype(np.float32)
+
+class _MatrixTransformerLike:
+    """Envuelve una matriz imagen->cancha con la interfaz .transform_points
+    (para que la homografia de PnLCalib entre en el mismo camino de suavizado)."""
+    def __init__(self, H):
+        self.m = np.asarray(H, dtype=np.float32)
+    def transform_points(self, points):
+        import cv2
+        pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+        return cv2.perspectiveTransform(pts, self.m).reshape(-1, 2)
+
+
+def solve_homography(frame_pts, pitch_pts, frame_w=None, frame_h=None,
+                     min_points=MIN_HOMOGRAPHY_POINTS):
+    """``(transformer, error_cm)`` o None si no pasa los controles de calidad.
+
+    Los controles son ABSOLUTOS (no comparan contra la transformacion anterior):
+    cantidad de puntos, spread en imagen, spread EN CANCHA y error de
+    reproyeccion. Comparar contra la anterior fue un error caro -- congelaba el
+    mapa, ver MAX_HOMOGRAPHY_JUMP_CM.
+    """
     try:
-        return ViewTransformer(source=frame_pts, target=pitch_pts)
+        from sports.common.view import ViewTransformer
     except Exception:
         return None
+    if len(frame_pts) < min_points:
+        return None
+
+    # Degenerada en IMAGEN: puntos amontonados o casi alineados.
+    span = frame_pts.max(axis=0) - frame_pts.min(axis=0)
+    if frame_w and frame_h:
+        if (span[0] < MIN_KEYPOINT_SPREAD * frame_w or
+                span[1] < MIN_KEYPOINT_SPREAD * frame_h):
+            return None
+    centred = frame_pts - frame_pts.mean(axis=0)
+    try:
+        sing = np.linalg.svd(centred, compute_uv=False)
+        if sing[0] <= 0 or sing[-1] / sing[0] < MIN_KEYPOINT_ASPECT:
+            return None
+    except np.linalg.LinAlgError:
+        return None
+
+    # Degenerada en CANCHA: anclada a un solo rincon del campo. Ajusta perfecto
+    # ahi y proyecta a cientos de metros en el resto de la imagen. MEDIDO: con
+    # solo el area de penal izquierda (span 20 m) las esquinas de la imagen
+    # proyectaban a (-17768, -14706) cm.
+    pspan = pitch_pts.max(axis=0) - pitch_pts.min(axis=0)
+    if (pspan[0] < MIN_KEYPOINT_PITCH_X_CM or
+            pspan[1] < MIN_KEYPOINT_PITCH_Y_CM):
+        return None
+
+    try:
+        transformer = ViewTransformer(source=frame_pts, target=pitch_pts)
+        back = transformer.transform_points(points=frame_pts)
+    except Exception:
+        return None
+    err = float(np.median(np.linalg.norm(back - pitch_pts, axis=1)))
+    if not np.isfinite(err) or err > MAX_REPROJECTION_CM:
+        return None
+    return transformer, err
+
+
+class KeypointBuffer:
+    """Ultima posicion en pantalla conocida de CADA vertice de cancha.
+
+    ⚠️ INDEXA POR VERTICE, no guarda una lista de observaciones, y la diferencia
+    NO es cosmetica. ``ViewTransformer`` llama a ``cv2.findHomography`` sin
+    metodo robusto, o sea minimos cuadrados sobre TODOS los puntos. Con una
+    ventana de 180 refrescos, los ~9 vertices del area de penal aparecen 180
+    veces cada uno y los del circulo central -- los unicos que aportan cancha --
+    unas pocas. El ajuste quedaria determinado en un 99% por el cluster de 20 m
+    y ``pitch_span`` lo aprobaria igual, porque mide el min/max y no ve que el
+    resto son duplicados. Seria peor que el bug actual: pasaria los controles
+    estando igual de mal. Una entrada por vertice le da a cada uno un voto.
+
+    Cada entrada envejece un refresco por vez y se descarta pasados
+    ``max_age``; cuando el vertice se vuelve a detectar, se reemplaza por la
+    medicion nueva y el arrastre acumulado se borra.
+    """
+
+    def __init__(self, max_age=KEYPOINT_BUFFER_REFRESHES):
+        self.max_age = max_age
+        self.seen = {}          # indice de vertice -> [x, y, edad en refrescos]
+        self.drag_errors = []   # px de error de arrastre medidos (ver add)
+        self._verts = None
+
+    def _vertices(self):
+        if self._verts is None:
+            from pitch_config import PITCH
+            self._verts = np.array(PITCH.vertices, dtype=np.float32)
+        return self._verts
+
+    def shift_from_keypoints(self, idx, img_pts, min_common=4):
+        """Movimiento de camara medido sobre los VERTICES, que estan quietos.
+
+        Mejor estimador que la mediana de los jugadores: un vertice de cancha
+        no se mueve nunca, asi que su desplazamiento en pantalla ES el de la
+        camara. Ademas re-ancla: como se mide contra la posicion guardada, el
+        error de arrastre no se acumula mientras el vertice siga a la vista.
+        Devuelve None si no hay vertices en comun (ahi cae a los jugadores).
+        """
+        d = [np.asarray(img_pts[k], dtype=float) - np.asarray(self.seen[int(i)][:2])
+             for k, i in enumerate(idx) if int(i) in self.seen]
+        if len(d) < min_common:
+            return None
+        d = np.asarray(d)
+        return float(np.median(d[:, 0])), float(np.median(d[:, 1]))
+
+    def advance(self, dx, dy):
+        """Corre lo guardado al frame actual y envejece las entradas."""
+        for v in self.seen.values():
+            v[0] += dx
+            v[1] += dy
+            v[2] += 1
+        self.seen = {i: v for i, v in self.seen.items() if v[2] <= self.max_age}
+
+    def add(self, idx, img_pts, stale_after=5):
+        """Reemplaza con la medicion nueva; de paso MIDE el error de arrastre.
+
+        Si un vertice no se veia hace ``stale_after`` refrescos y reaparece, la
+        distancia entre donde lo arrastramos y donde esta de verdad es el error
+        acumulado de la compensacion. Es la unica forma de saber si la ventana
+        de 60 s se banca el arrastre o hay que acortarla.
+        """
+        for k, i in enumerate(idx):
+            i = int(i)
+            prev = self.seen.get(i)
+            x, y = float(img_pts[k][0]), float(img_pts[k][1])
+            if prev is not None and prev[2] >= stale_after:
+                self.drag_errors.append(float(np.hypot(x - prev[0], y - prev[1])))
+            self.seen[i] = [x, y, 0]
+
+    def collect(self):
+        """``(img_pts, pitch_pts)`` con UNA entrada por vertice."""
+        if not self.seen:
+            return None, None
+        idx = sorted(self.seen)
+        img = np.array([self.seen[i][:2] for i in idx], dtype=np.float32)
+        pitch = self._vertices()[idx].astype(np.float32)
+        return img, pitch
+
+    def pitch_span(self):
+        _i, p = self.collect()
+        if p is None:
+            return 0.0, 0.0
+        return (p[:, 0].max() - p[:, 0].min(), p[:, 1].max() - p[:, 1].min())
+
+    def drag_error_p50(self):
+        if not self.drag_errors:
+            return float("nan")
+        return float(np.median(self.drag_errors))
+
+
+def median_image_shift(prev_by_id, now_by_id, min_common=5):
+    """Movimiento COMUN de los jugadores en pantalla = movimiento de camara.
+
+    Cada jugador se mueve para su lado, asi que la mediana cancela el
+    movimiento propio y deja el de la camara. Devuelve (dx, dy) o (0, 0).
+    """
+    common = prev_by_id.keys() & now_by_id.keys()
+    if len(common) < min_common:
+        return 0.0, 0.0
+    dx = np.median([now_by_id[k][0] - prev_by_id[k][0] for k in common])
+    dy = np.median([now_by_id[k][1] - prev_by_id[k][1] for k in common])
+    return float(dx), float(dy)
+
+
+def _canonical_image_points(frame_w, frame_h):
+    """Cuatro puntos fijos de la imagen, repartidos sobre la zona de juego.
+
+    Sirven de "sonda": se mira a que parte de la cancha proyectan y se suaviza
+    ESO. Se evitan los bordes porque cerca del horizonte la homografia es mal
+    condicionada y amplifica cualquier ruido.
+    """
+    import numpy as np
+    return np.array([
+        [0.15 * frame_w, 0.35 * frame_h],
+        [0.85 * frame_w, 0.35 * frame_h],
+        [0.85 * frame_w, 0.90 * frame_h],
+        [0.15 * frame_w, 0.90 * frame_h],
+    ], dtype=np.float32)
+
+
+def smooth_transformer(new_transformer, canon_img, prev_pitch,
+                       alpha=HOMOGRAPHY_SMOOTH_ALPHA):
+    """Promedio movil de la transformacion. Devuelve ``(transformer, pitch)``.
+
+    ``prev_pitch`` es el estado suavizado anterior (o None la primera vez).
+    """
+    from sports.common.view import ViewTransformer
+
+    new_pitch = new_transformer.transform_points(points=canon_img)
+    if not np.all(np.isfinite(new_pitch)):
+        return None, prev_pitch
+    pitch = new_pitch if prev_pitch is None else \
+        alpha * new_pitch + (1.0 - alpha) * prev_pitch
+    try:
+        return (ViewTransformer(source=canon_img,
+                                target=pitch.astype(np.float32)), pitch)
+    except Exception:
+        return None, prev_pitch
 
 
 def anchors_to_pitch(detections, transformer):
@@ -275,6 +652,22 @@ def resolve_ball_class_id(model):
     return COCO_SPORTS_BALL
 
 
+def resolve_goalkeeper_class_id(model):
+    """Class id del arquero, o None si el modelo no lo distingue.
+
+    El clasificador de equipos hace k-means con DOS grupos sobre el color de
+    camiseta, y el arquero usa un tercer color: cae en cualquiera de los dos al
+    azar. Medido en spain-france: los arqueros salieron 58/42 y 62/38 entre
+    Home y Away, o sea sin senal. Conservar la clase del detector es la unica
+    forma limpia de saber quien es arquero; el color no alcanza.
+    """
+    names = getattr(model, "names", None) or {}
+    for class_id, name in names.items():
+        if str(name).strip().lower() in ("goalkeeper", "goal keeper", "gk"):
+            return int(class_id)
+    return None
+
+
 def resolve_player_class_ids(model):
     """Class ids the tracker should treat as players (players + goalkeepers).
 
@@ -289,10 +682,86 @@ def resolve_player_class_ids(model):
     return ids or [COCO_PERSON]
 
 
+def _ball_crop_window(last_px, vel_px, frame_w, frame_h, size=BALL_CROP_SIZE):
+    """Ventana (x0, y0, x1, y1) centrada donde se PREDICE que esta la pelota.
+
+    Se proyecta la ultima posicion con su velocidad: en una pelota rapida el
+    centro del recorte tiene que adelantarse, si no la jugada se escapa de la
+    ventana justo cuando mas importa (un pase largo).
+    """
+    cx = last_px[0] + vel_px[0]
+    cy = last_px[1] + vel_px[1]
+    half = size // 2
+    x0 = int(max(0, min(frame_w - size, cx - half)))
+    y0 = int(max(0, min(frame_h - size, cy - half)))
+    return x0, y0, x0 + size, y0 + size
+
+
+def _ball_offpitch(x, y, margin=BALL_OFFPITCH_MARGIN):
+    """True si un candidato a pelota cae fuera del campo con margen."""
+    return (x < -margin * PITCH_LENGTH_CM or x > (1 + margin) * PITCH_LENGTH_CM or
+            y < -margin * PITCH_WIDTH_CM or y > (1 + margin) * PITCH_WIDTH_CM)
+
+
+def _pick_ball(ball_detections, ball_pitch, last_pitch, gap_frames,
+               fps=DEFAULT_TRACK_FPS):
+    """Choose one ball detection, preferring trajectory continuity.
+
+    Works in PITCH COORDINATES (centimetres), never pixels. An earlier version
+    gated in pixel space and only cut impossible moves 24.5% -> 12.1%, because
+    the homography is perspective: the same pixel distance is a few metres near
+    the camera and many metres at the far touchline, so a pixel radius is far
+    too permissive exactly where play is furthest away. Distances are compared
+    in metres, which is also the unit the "impossible move" metric uses.
+
+    ``last_pitch`` is the previously accepted ball position (cm) or None, and
+    ``gap_frames`` how many frames ago it was seen. Reachability is a HARD
+    filter -- confidence only breaks ties among physically possible candidates,
+    so a high-confidence pitch marking cannot outvote a faint real ball.
+    Returns empty selections when nothing is reachable: leaving the frame blank
+    (interpolate_ball bridges it) beats recording an impossible position.
+
+    Always index Detections with a SLICE (``[i:i+1]``): supervision validates
+    that ``xyxy`` stays 2-D (N, 4) and scalar indexing raises deep inside
+    ``Detections.__post_init__``.
+    """
+    conf = ball_detections.confidence
+    if len(ball_detections) == 0:
+        return ball_detections, ball_pitch
+
+    # Reachable radius in centimetres, growing with the blank gap so a
+    # genuinely lost ball is re-acquired instead of suppressed forever.
+    radius_cm = (MAX_BALL_SPEED_MS * max(1, gap_frames) / max(1.0, fps)) * 100.0
+
+    ok = []
+    for i, (x, y) in enumerate(ball_pitch):
+        # Fuera del campo: descarte DURO. Una botella en la banda no es la
+        # pelota por mucha confianza que tenga el detector.
+        if _ball_offpitch(x, y):
+            continue
+        if last_pitch is None:
+            dist = 0.0
+        else:
+            dist = ((x - last_pitch[0]) ** 2 + (y - last_pitch[1]) ** 2) ** 0.5
+            if dist > radius_cm:
+                continue
+        c = float(conf[i]) if conf is not None else 1.0
+        ok.append((c, -dist, i))
+
+    if not ok:
+        return ball_detections[0:0], ball_pitch[0:0]
+
+    best = max(ok)[2]
+    return ball_detections[best:best + 1], ball_pitch[best:best + 1]
+
+
 def get_detections(frame, player_result, ball_result, tracker, team_classifier,
                    frame_w, frame_h, ball_class_id=COCO_SPORTS_BALL,
                    player_class_ids=(COCO_PERSON,), player_conf=DEFAULT_PLAYER_CONF,
-                   transformer=None):
+                   goalkeeper_class_id=None,
+                   transformer=None, last_ball_pitch=None, frames_since_ball=1,
+                   ball_crop_result=None, crop_offset=(0, 0),
+                   effective_fps=DEFAULT_TRACK_FPS):
     import supervision as sv
 
     # Players: keep the player/goalkeeper classes (drop ball & referee). When a
@@ -304,22 +773,54 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
         players_detections = players_detections[players_detections.confidence >= player_conf]
     players_detections = players_detections.with_nms(threshold=0.5, class_agnostic=True)
     players_detections = tracker.update_with_detections(detections=players_detections)
+    # Se lee DESPUES del filtro de confianza, el NMS y el tracker (que cambian
+    # cuantas detecciones hay) y ANTES del clasificador de equipos, que es
+    # quien sobrescribe ``class_id`` con el equipo.
+    gk_mask = (players_detections.class_id == goalkeeper_class_id
+               if goalkeeper_class_id is not None
+               and players_detections.class_id is not None else None)
 
     if team_classifier and len(players_detections):
         players_crops = [sv.crop_image(frame, xyxy) for xyxy in players_detections.xyxy]
-        players_detections.class_id = team_classifier.predict(players_crops)
+        teams = np.asarray(team_classifier.predict(players_crops))
+        # El arquero lleva un tercer color de camiseta y el clasificador solo
+        # tiene DOS grupos, asi que lo asigna al azar (medido: 58/42 y 62/38).
+        # Se lo marca como equipo 2 en vez de forzarlo a uno de los dos: mejor
+        # "no se" que un dato inventado que despues genera pases y perdidas
+        # fantasma contra el arquero.
+        if goalkeeper_class_id is not None and gk_mask is not None and len(gk_mask):
+            teams = np.where(gk_mask, GOALKEEPER_TEAM_ID, teams)
+        players_detections.class_id = teams
     else:
         players_detections.class_id = np.zeros(len(players_detections), dtype=int)
 
     # Ball: filter to the model's ball class (0 for football models, 32 for COCO).
     ball_all = sv.Detections.from_ultralytics(ball_result)
     ball_detections = ball_all[ball_all.class_id == ball_class_id]
-    # The ball is unique: at low confidence several boxes can fire, so keep only
-    # the single most confident one (a stray false positive must not replace the
-    # real ball).
-    if len(ball_detections) > 1 and ball_detections.confidence is not None:
-        best = int(np.argmax(ball_detections.confidence))
-        ball_detections = ball_detections[best:best + 1]
+
+    # Candidatos extra del recorte de alta resolucion. Sus coordenadas son
+    # relativas al recorte, asi que se trasladan al frame completo antes de
+    # mezclarlos: a partir de aca son un candidato mas, indistinguible de los
+    # del frame entero, y el gate de continuidad decide.
+    if ball_crop_result is not None:
+        crop_all = sv.Detections.from_ultralytics(ball_crop_result)
+        crop_ball = crop_all[crop_all.class_id == ball_class_id]
+        if len(crop_ball):
+            crop_ball.xyxy = crop_ball.xyxy + np.array(
+                [crop_offset[0], crop_offset[1], crop_offset[0], crop_offset[1]],
+                dtype=crop_ball.xyxy.dtype)
+            ball_detections = sv.Detections.merge([ball_detections, crop_ball]) \
+                if len(ball_detections) else crop_ball
+    # The ball is unique, so only one box survives. Picking purely by
+    # confidence is WRONG on a fixed camera: the penalty spot, pitch markings
+    # and crowd objects are small white blobs that regularly out-score the real
+    # ball, and each time they do the stored position teleports. Measured on
+    # spain-france: 25% of consecutive ball movements were physically
+    # impossible (p90 = 417 m/s = 1502 km/h), which is what makes possession
+    # flicker and defeats any physics-based possession logic downstream.
+    # So candidates are scored by CONTINUITY first: a candidate reachable from
+    # the last known position at a plausible speed beats a more confident one
+    # that would require teleporting.
 
     # Project to pitch coords. Image-space is always on-pitch but approximate;
     # the homography is accurate but goes wild on bad-keypoint frames. So: keep
@@ -348,10 +849,38 @@ def get_detections(frame, player_result, ball_result, tracker, team_classifier,
             else:
                 ball_pitch = h_ball
 
+    # Snapshot of EVERY ball candidate with its pitch position, before the
+    # greedy gate throws all but one away. The gate below is causal (it only
+    # looks backwards), so it can lock onto a wrong object and then reject the
+    # real ball as "unreachable" for a while. Keeping the candidates lets
+    # ball_viterbi.py re-solve the whole trajectory globally afterwards, which
+    # recovers exactly those cases -- without re-running detection.
+    ball_pitch_all = np.asarray(ball_pitch, dtype=float).reshape(-1, 2)
+    candidates = []
+    if len(ball_detections):
+        conf_all = ball_detections.confidence
+        order = (np.argsort(-conf_all)[:BALL_CANDIDATES_PER_FRAME]
+                 if conf_all is not None
+                 else range(min(BALL_CANDIDATES_PER_FRAME, len(ball_detections))))
+        for i in order:
+            box = ball_detections.xyxy[i]
+            candidates.append((
+                float(conf_all[i]) if conf_all is not None else 1.0,
+                float(box[0]), float(box[1]), float(box[2]), float(box[3]),
+                float(ball_pitch_all[i][0]), float(ball_pitch_all[i][1]),
+            ))
+
+    # Continuity gate LAST, now that ball candidates have real pitch
+    # coordinates: the physics of "how far can a ball travel" only makes sense
+    # in metres, not pixels (see _pick_ball).
+    ball_detections, ball_pitch = _pick_ball(
+        ball_detections, ball_pitch_all,
+        last_ball_pitch, frames_since_ball, fps=effective_fps)
+
     players_detections.data["pitch_xy"] = players_pitch
     ball_detections.data["pitch_xy"] = ball_pitch
 
-    return players_detections, ball_detections
+    return players_detections, ball_detections, candidates
 
 
 def generate_team_model(video_path, player_model, player_class_ids=(COCO_PERSON,),
@@ -474,7 +1003,8 @@ def track(video_path, output_dir,
           min_track_frames=DEFAULT_MIN_TRACK_FRAMES, imgsz=DEFAULT_IMGSZ,
           pitch_model_path=DEFAULT_PITCH_MODEL, pitch_conf=DEFAULT_PITCH_CONF,
           homography_every=DEFAULT_HOMOGRAPHY_EVERY, pitch_imgsz=DEFAULT_PITCH_IMGSZ,
-          track_teams=True, generate_video=False, stride=30):
+          track_teams=True, generate_video=False, stride=30, frame_stride=1,
+          ball_crop=False):
     import supervision as sv
     from ultralytics import YOLO
 
@@ -488,6 +1018,11 @@ def track(video_path, output_dir,
         resolved_player_path = FALLBACK_PLAYER_MODEL
         player_model = YOLO(FALLBACK_PLAYER_MODEL)
     player_class_ids = resolve_player_class_ids(player_model)
+    goalkeeper_class_id = resolve_goalkeeper_class_id(player_model)
+    if goalkeeper_class_id is not None:
+        print(f"Arqueros identificados por clase (id {goalkeeper_class_id}) y "
+              f"marcados como equipo {GOALKEEPER_TEAM_ID} (el clasificador de "
+              f"color no los distingue).")
 
     # Resolve the ball model. If it resolves to the same weights as the player
     # model, reuse it and run a single inference per frame.
@@ -506,15 +1041,29 @@ def track(video_path, output_dir,
     ball_class_id = resolve_ball_class_id(ball_model)
 
     # Pitch keypoint model for homography (optional; falls back to image space).
+    # Calibracion. "pnlcalib" usa PnLCalib (SOTA, 0,56 m, ver pitch_calib.py);
+    # cualquier otro valor cae al detector de keypoints viejo (martinjolif).
     pitch_model = None
-    resolved_pitch_path = resolve_pitch_model_path(pitch_model_path)
-    if resolved_pitch_path:
+    pnl = None
+    if str(pitch_model_path).lower() == "pnlcalib":
         try:
-            pitch_model = YOLO(resolved_pitch_path)
+            from pitch_calib import PnLCalibrator
+            import torch
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            pnl = PnLCalibrator(device=dev)
+            print(f"Calibracion con PnLCalib (device={dev})")
         except Exception as exc:
-            print(f"Failed to load pitch model '{resolved_pitch_path}' ({exc}); "
-                  f"using image-space coords (no homography)")
-            pitch_model = None
+            print(f"No pude cargar PnLCalib ({exc}); sin homografia")
+            pnl = None
+    else:
+        resolved_pitch_path = resolve_pitch_model_path(pitch_model_path)
+        if resolved_pitch_path:
+            try:
+                pitch_model = YOLO(resolved_pitch_path)
+            except Exception as exc:
+                print(f"Failed to load pitch model '{resolved_pitch_path}' ({exc}); "
+                      f"using image-space coords (no homography)")
+                pitch_model = None
 
     ellipse_annotator = triangle_annotator = label_annotator = None
     if generate_video:
@@ -530,9 +1079,38 @@ def track(video_path, output_dir,
     frame_w, frame_h = video_info.width, video_info.height
     fps = int(round(video_info.fps)) or 24
 
+    # ``frame_stride`` runs detection on every Nth video frame: N=2 halves the
+    # GPU cost. The written frame numbers stay CONSECUTIVE (1..M over processed
+    # frames) because lib/ball.py indexes ``frames[frame_number - 1]`` and
+    # event_generator walks ``range(1, match.frames + 1)`` -- gaps would break
+    # both. The real timeline is preserved via the sidecar ``effective_fps``.
+    frame_stride = max(1, int(frame_stride))
+    effective_fps = fps / frame_stride
+
+    # Every frame-count parameter below is expressed in *processed* frames, so
+    # dividing by the stride keeps its meaning in SECONDS unchanged.
+    if frame_stride > 1:
+        track_buffer = max(1, round(track_buffer / frame_stride))
+        min_track_frames = max(1, round(min_track_frames / frame_stride))
+        ball_interp_gap = max(1, round(ball_interp_gap / frame_stride))
+        # ``homography_every`` is deliberately NOT rescaled: it stays in
+        # processed frames, so the pitch model runs ``frame_stride`` times less
+        # often in wall-clock terms. On a fixed/tactical camera the homography
+        # barely moves, so that costs nothing and pays for the second detection
+        # pass. Lower it manually if the camera pans a lot.
+        print(f"frame-stride {frame_stride}: procesando 1 de cada {frame_stride} frames "
+              f"({fps} fps -> {effective_fps:g} fps efectivos).")
+        print(f"  reescalados (conservan su valor en segundos): "
+              f"track-buffer={track_buffer}, min-track-frames={min_track_frames}, "
+              f"ball-interp-gap={ball_interp_gap}")
+        print(f"  homography-every={homography_every} sin reescalar "
+              f"(refresca cada {homography_every * frame_stride} frames de video; "
+              f"OK con camara fija)")
+
     # Longer lost-track buffer => fewer fragmented ids across occlusions.
     try:
-        tracker = sv.ByteTrack(lost_track_buffer=track_buffer, frame_rate=fps)
+        tracker = sv.ByteTrack(lost_track_buffer=track_buffer,
+                               frame_rate=max(1, int(round(effective_fps))))
     except TypeError:  # older supervision signature without these kwargs
         tracker = sv.ByteTrack()
     tracker.reset()
@@ -554,8 +1132,21 @@ def track(video_path, output_dir,
     frame_generator = sv.get_video_frames_generator(video_path)
 
     players, ball = {}, {}
+    ball_candidates = []      # (frame, conf, x1, y1, x2, y2, x_pitch, y_pitch)
     frame_number = 1
+    # Last accepted ball position (pitch cm) + how long ago, for _pick_ball.
+    last_ball_pitch, frames_since_ball = None, 1
+    # Posicion y velocidad de la pelota en PIXELES, para centrar el recorte.
+    last_ball_px, ball_vel_px = None, (0.0, 0.0)
     transformer = None  # most recent image->pitch homography
+    last_homog_err = 1e9        # error de reproyeccion de la transformacion vigente
+    n_homog_ok = n_homog_rejected = n_homog_jumps = 0
+    n_shift_kps = n_shift_players = 0
+    canon_img = _canonical_image_points(frame_w, frame_h)
+    smooth_pitch = None         # estado del promedio movil de la homografia
+    kp_buffer = KeypointBuffer()
+    last_players_img = {}       # id -> centro en pantalla, frame actual
+    players_at_refresh = {}     # idem, congelado en el ultimo refresco
 
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     annotated_video_path = os.path.join(output_dir, video_name + "_tracked.mp4")
@@ -564,7 +1155,12 @@ def track(video_path, output_dir,
         sink.__enter__()
 
     shared_conf = min(DEFAULT_PLAYER_CONF, ball_conf)
-    for frame in tqdm(frame_generator, desc="Collecting Tracking Data..."):
+    for source_index, frame in enumerate(tqdm(frame_generator, desc="Collecting Tracking Data...")):
+        # Skip the frames the stride drops *before* any inference -- decoding is
+        # cheap, the two YOLO passes are what costs.
+        if source_index % frame_stride:
+            continue
+
         if share_model:
             # One pass at the lower confidence; players are re-thresholded in
             # get_detections so their behaviour is unchanged.
@@ -574,21 +1170,108 @@ def track(video_path, output_dir,
             player_result = player_model(frame, conf=DEFAULT_PLAYER_CONF, imgsz=imgsz, verbose=False)[0]
             ball_result = ball_model(frame, conf=ball_conf, imgsz=imgsz, verbose=False)[0]
 
-        # Refresh the homography every ``homography_every`` frames; reuse the
-        # last good transform in between (and keep it if a frame has too few
-        # keypoints to solve a new one).
-        if pitch_model is not None and (frame_number - 1) % homography_every == 0:
-            pitch_result = pitch_model(frame, imgsz=min(pitch_imgsz, imgsz), verbose=False)[0]
-            new_transformer = build_pitch_transformer(pitch_result, min_conf=pitch_conf)
-            if new_transformer is not None:
-                transformer = new_transformer
+        # Recorte de alta resolucion alrededor de la pelota predicha. Solo se
+        # hace si ya sabemos donde estaba: sin historial no hay donde recortar.
+        ball_crop_result, crop_offset = None, (0, 0)
+        if ball_crop and last_ball_px is not None:
+            x0, y0, x1, y1 = _ball_crop_window(
+                last_ball_px, ball_vel_px, frame_w, frame_h)
+            crop = frame[y0:y1, x0:x1]
+            if crop.size:
+                # imgsz = el lado del recorte: se procesa a resolucion NATIVA,
+                # sin reescalar, que es todo el truco.
+                ball_crop_result = ball_model(crop, conf=ball_conf,
+                                              imgsz=BALL_CROP_SIZE,
+                                              verbose=False)[0]
+                crop_offset = (x0, y0)
 
-        all_detections, ball_detections = get_detections(
+        # Refresh de la homografia cada ``homography_every`` frames. Los
+        # keypoints de un frame solo NO alcanzan (cubren ~20 m de cancha), asi
+        # que se acumulan los de los ultimos refrescos arrastrandolos con el
+        # movimiento de camara. Ver KEYPOINT_BUFFER_REFRESHES.
+        if pnl is not None and (frame_number - 1) % homography_every == 0:
+            # PnLCalib da la homografia del frame directo (no necesita buffer ni
+            # acumulacion: ve toda la cancha, no un parche). Se suaviza igual.
+            Hd = pnl.homography(frame)
+            if Hd is None:
+                n_homog_rejected += 1
+            else:
+                new_transformer = _MatrixTransformerLike(Hd)
+                sm, smooth_pitch = smooth_transformer(new_transformer, canon_img, smooth_pitch)
+                transformer = sm if sm is not None else new_transformer
+                n_homog_ok += 1
+        elif pitch_model is not None and (frame_number - 1) % homography_every == 0:
+            # 1. Detectar PRIMERO. Los vertices de cancha son el mejor
+            #    estimador del movimiento de camara: estan quietos, asi que su
+            #    desplazamiento en pantalla es el de la camara y punto. La
+            #    mediana de los jugadores es el plan B (se mueven, y hay que
+            #    confiar en que la mediana cancele el movimiento propio).
+            pitch_result = pitch_model(frame, imgsz=min(pitch_imgsz, imgsz), verbose=False)[0]
+            kps = extract_keypoints(pitch_result, min_conf=pitch_conf)
+
+            # 2. Compensar el paneo antes de mezclar lo viejo con lo nuevo.
+            shift = kp_buffer.shift_from_keypoints(*kps) if kps is not None else None
+            if shift is None:
+                shift = median_image_shift(players_at_refresh, last_players_img)
+                n_shift_players += 1
+            else:
+                n_shift_kps += 1
+            kp_buffer.advance(*shift)
+            players_at_refresh = dict(last_players_img)
+
+            # 3. Las mediciones de este frame pisan lo arrastrado.
+            if kps is not None:
+                kp_buffer.add(*kps)
+
+            img_pts, pitch_pts = kp_buffer.collect()
+            built = (solve_homography(img_pts, pitch_pts, frame_w, frame_h)
+                     if img_pts is not None else None)
+            if built is None:
+                n_homog_rejected += 1
+            else:
+                new_transformer, new_err = built
+                # Guarda ANTI-CATASTROFE. Deliberadamente flojo: una version
+                # anterior la uso como control de continuidad y congelo el mapa
+                # (19 aceptadas de 540), lo que arruino la calibracion mientras
+                # sacaba nota perfecta en el test de estabilidad.
+                accept = True
+                if transformer is not None:
+                    try:
+                        probe = canon_img
+                        jump = float(np.median(np.linalg.norm(
+                            transformer.transform_points(points=probe) -
+                            new_transformer.transform_points(points=probe), axis=1)))
+                    except Exception:
+                        jump = 0.0
+                    if jump > MAX_HOMOGRAPHY_JUMP_CM and new_err >= last_homog_err * 0.5:
+                        accept = False
+                        n_homog_jumps += 1
+                if accept:
+                    sm, smooth_pitch = smooth_transformer(
+                        new_transformer, canon_img, smooth_pitch)
+                    transformer = sm if sm is not None else new_transformer
+                    last_homog_err = max(new_err, 1.0)
+                    n_homog_ok += 1
+
+        all_detections, ball_detections, ball_cands = get_detections(
             frame, player_result, ball_result, tracker, team_classifier, frame_w, frame_h,
             ball_class_id=ball_class_id, player_class_ids=player_class_ids,
-            player_conf=DEFAULT_PLAYER_CONF, transformer=transformer)
+            goalkeeper_class_id=goalkeeper_class_id,
+            player_conf=DEFAULT_PLAYER_CONF, transformer=transformer,
+            last_ball_pitch=last_ball_pitch, frames_since_ball=frames_since_ball,
+            effective_fps=effective_fps,
+            ball_crop_result=ball_crop_result, crop_offset=crop_offset)
+
+        for cand in ball_cands:
+            ball_candidates.append((frame_number,) + cand)
 
         object_ids = all_detections.tracker_id
+        # Centro en pantalla de cada jugador: sirve para medir el movimiento de
+        # camara entre refrescos (la mediana cancela el movimiento propio).
+        last_players_img = {
+            str(object_ids[i]): ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+            for i, b in enumerate(all_detections.xyxy)
+        }
         team_ids = all_detections.class_id
         pitch_xys = all_detections.data["pitch_xy"]
         ball_pitch_xys = ball_detections.data["pitch_xy"]
@@ -605,11 +1288,19 @@ def track(video_path, output_dir,
 
         if ball_detections.xyxy.shape[0]:
             b = ball_detections
+            last_ball_pitch = (ball_pitch_xys[0][0], ball_pitch_xys[0][1])
+            _bb = b.xyxy[0]
+            px = ((_bb[0] + _bb[2]) / 2.0, (_bb[1] + _bb[3]) / 2.0)
+            if last_ball_px is not None:
+                ball_vel_px = (px[0] - last_ball_px[0], px[1] - last_ball_px[1])
+            last_ball_px = px
+            frames_since_ball = 1
             ball[str(frame_number)] = {
                 "X1": b.xyxy[0][0], "Y1": b.xyxy[0][1], "X2": b.xyxy[0][2], "Y2": b.xyxy[0][3],
                 "X_Pitch": ball_pitch_xys[0][0], "Y_Pitch": ball_pitch_xys[0][1],
             }
         else:
+            frames_since_ball += 1
             ball[str(frame_number)] = {
                 "X1": 0, "Y1": 0, "X2": 0, "Y2": 0, "X_Pitch": 0, "Y_Pitch": 0,
             }
@@ -627,6 +1318,30 @@ def track(video_path, output_dir,
     if sink:
         sink.__exit__(None, None, None)
 
+    total_h = n_homog_ok + n_homog_rejected + n_homog_jumps
+    if total_h and pnl is not None:
+        print(f"Homografia (PnLCalib): {n_homog_ok} aceptadas, "
+              f"{n_homog_rejected} sin calibrar ({100.0*n_homog_rejected/total_h:.1f}%)")
+    elif total_h:
+        sx, sy = kp_buffer.pitch_span()
+        drag = kp_buffer.drag_error_p50()
+        print(f"Keypoints acumulados al final: {len(kp_buffer.seen)} vertices "
+              f"distintos cubriendo {sx/100:.0f} x {sy/100:.0f} m de cancha "
+              f"(un frame solo cubre ~20 x 55 m; el techo del clip es 69 x 70)")
+        # Si el arrastre acumulado es de decenas de pixeles, la ventana de 60 s
+        # es demasiado larga para una compensacion que solo traslada.
+        n_shift = n_shift_kps + n_shift_players
+        if n_shift:
+            print(f"  paneo estimado con vertices en {100.0*n_shift_kps/n_shift:.0f}% "
+                  f"de los refrescos, con jugadores en el resto")
+        if np.isfinite(drag):
+            print(f"  error de arrastre al re-detectar un vertice viejo: "
+                  f"mediana {drag:.1f} px sobre {len(kp_buffer.drag_errors)} "
+                  f"mediciones (sano < 10 px)")
+        print(f"Homografia: {n_homog_ok} aceptadas, {n_homog_rejected} descartadas "
+              f"por calidad, {n_homog_jumps} descartadas por salto "
+              f"({100.0 * (n_homog_rejected + n_homog_jumps) / total_h:.1f}% rechazo)")
+
     # Drop fragmented (ultra-short) player tracks before events.
     players, dropped = drop_short_tracks(players, min_track_frames)
     if dropped:
@@ -639,8 +1354,30 @@ def track(video_path, output_dir,
         print(f"Interpolated the ball across {filled} missed frame(s) "
               f"(gaps <= {ball_interp_gap}).")
 
+    cand_path = os.path.join(output_dir, video_name + "_ball_candidates.csv")
+    with open(cand_path, "w", newline="") as fh:
+        fh.write("Frame,Conf,X1,Y1,X2,Y2,X_Pitch,Y_Pitch\n")
+        fh.writelines(
+            f"{c[0]},{c[1]:.4f},{c[2]:.1f},{c[3]:.1f},{c[4]:.1f},{c[5]:.1f},"
+            f"{c[6]:.1f},{c[7]:.1f}\n" for c in ball_candidates)
+    print(f"Candidatos de pelota: {cand_path} ({len(ball_candidates)} filas)")
+
     output_path = os.path.join(output_dir, video_name + ".csv")
     save_tracking_results(players, ball, frame_number, output_path)
+
+    # Sidecar so downstream tools recover the real timeline: with a stride the
+    # CSV's consecutive frame numbers tick at ``effective_fps``, not the video's
+    # fps, and every timestamp would be off by the stride factor without this.
+    meta_path = os.path.join(output_dir, video_name + ".meta.json")
+    with open(meta_path, "w") as meta_file:
+        json.dump({
+            "video": os.path.basename(video_path),
+            "source_fps": fps,
+            "frame_stride": frame_stride,
+            "effective_fps": effective_fps,
+            "tracked_frames": frame_number - 1,
+        }, meta_file, indent=2)
+    print(f"Metadata: {meta_path} (effective_fps={effective_fps:g})")
     return output_path
 
 
@@ -671,9 +1408,10 @@ def parse_args():
                         help="Inference resolution (default 1280). Higher recovers more small "
                              "ball detections but is slower; 640 is the fast/low-recall option.")
     parser.add_argument("--pitch-model", default=DEFAULT_PITCH_MODEL,
-                        help="Pitch keypoint model for homography. 'football-field' (default) "
-                             "downloads it from the HF Hub; 'none' disables homography and uses "
-                             "image-space coords; or pass a path to a .pt file.")
+                        help="Calibracion imagen->cancha. 'pnlcalib' (RECOMENDADO, SOTA, "
+                             "0,56 m; requiere PnLCalib clonado + PNLCALIB_DIR, ver "
+                             "pitch_calib.py); 'football-field' el detector viejo (26,9 m); "
+                             "'none' sin homografia; o un path a .pt.")
     parser.add_argument("--pitch-conf", type=float, default=DEFAULT_PITCH_CONF,
                         help="Min keypoint confidence used in the homography (default 0.5).")
     parser.add_argument("--homography-every", type=int, default=DEFAULT_HOMOGRAPHY_EVERY,
@@ -684,6 +1422,19 @@ def parse_args():
     parser.add_argument("--no-teams", action="store_true", help="Disable team classification.")
     parser.add_argument("--generate-video", action="store_true", help="Also write an annotated video.")
     parser.add_argument("--stride", type=int, default=30, help="Frame stride for team-model crops.")
+    parser.add_argument("--ball-crop", action="store_true",
+                        help="Ademas del frame completo, corre el modelo de "
+                             "pelota sobre un recorte de 640 px a resolucion "
+                             "NATIVA centrado donde se predice la pelota. A "
+                             "1080p la pelota mide ~9 px; en el recorte "
+                             "conserva su tamano real. Cuesta como una "
+                             "inferencia de 640 (barato) y da candidatos que "
+                             "el frame completo pierde.")
+    parser.add_argument("--frame-stride", type=int, default=1,
+                        help="Run detection on every Nth video frame (2 = half the GPU cost). "
+                             "Frame-count options are rescaled automatically so their meaning "
+                             "in seconds is unchanged; the true timeline is recorded in the "
+                             "sidecar .meta.json. Higher values fragment tracks more.")
     return parser.parse_args()
 
 
@@ -706,6 +1457,8 @@ def main():
         track_teams=not args.no_teams,
         generate_video=args.generate_video,
         stride=args.stride,
+        frame_stride=args.frame_stride,
+        ball_crop=args.ball_crop,
     )
     print(f"Tracking data written to: {out}")
 

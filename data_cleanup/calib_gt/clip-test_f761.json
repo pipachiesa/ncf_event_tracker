@@ -1,0 +1,59 @@
+{
+  "video": "spain-france-test3min.mp4",
+  "csv_frame": 761,
+  "video_frame_0based": 1520,
+  "frame_stride": 2,
+  "sistema_de_coordenadas": "cancha REGLAMENTARIA 105x68 con area de 16,5 m (ver data_cleanup/pitch_config.py). ⚠️ Los CSV generados antes del 20-ago estan en el espacio viejo (120x70, area 20,15) y NO se pueden medir con esto.",
+  "como_se_hizo": "Sin anotacion manual. (1) registrar los 540 refrescos contra este frame con SIFT+RANSAC; (2) acumular ahi las mascaras de lineas blancas de todo el clip, votando por pixel -> un mosaico que muestra el circulo central completo, el area, la D y las dos laterales; (3) Hough sobre el mosaico -> 7 lineas; (4) enumerar asignaciones de 2 lineas x 2 lineas a coordenadas de cancha (864 hipotesis) y elegir por costo simetrico de alineacion; (5) refinar contra las lineas de este frame.",
+  "homografia_imagen_a_cancha": [
+    [
+      5.295430497531398,
+      10.360565594355693,
+      -4311.436910889384
+    ],
+    [
+      -1.7903744201174547,
+      23.450109597766744,
+      -776.8099585273243
+    ],
+    [
+      -2.071430505689351e-06,
+      0.0018772039908594462,
+      1.0
+    ]
+  ],
+  "costo_de_alineacion": 16.15,
+  "residuo_por_elemento_px": {
+    "linea de gol": 1.9,
+    "lateral lejano": 1.4,
+    "lateral cercano": 3.7,
+    "linea media": 0.5,
+    "area a": 13.6,
+    "area b": 0.9,
+    "area c": 0.1,
+    "chica a": 2.7,
+    "chica b": 0.2,
+    "chica c": 0.1,
+    "circulo central": 7.0,
+    "D": 1.8
+  },
+  "nota": "El area chica pasa de 13,6 px (geometria vieja) a 0,2 px, y la D ajusta en 1,8 px. Con la geometria de sports la D seria tangente al area y no podria ajustar: es la confirmacion de que la geometria ya es la buena. Los dos elementos que quedan altos son 'area a' (pegado a los carteles, mascara ruidosa) y el circulo central.",
+  "landmarks_de_referencia_cm": {
+    "esquina lejana del area": [
+      1650,
+      1384.0
+    ],
+    "esquina cercana del area": [
+      1650,
+      5416.0
+    ],
+    "punto de penal": [
+      1100,
+      3400.0
+    ],
+    "centro del circulo": [
+      5250.0,
+      3400.0
+    ]
+  }
+}

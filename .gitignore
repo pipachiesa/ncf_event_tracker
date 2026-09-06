@@ -184,3 +184,24 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+T-DEED/
+venv/
+
+# events_model/dataset/ SI se versiona (labels + features, son livianos).
+# Estos son los intermedios de trabajo del flujo por partido, no el dataset:
+events_model/dataset/*_proposed.csv
+events_model/dataset/*.review.json
+events_model/dataset/*_features.csv
+events_model/dataset/train.csv
+events_model/dataset/val.csv
+events_model/dataset/test.csv
+# Red de seguridad: que nunca entre video ni tracking crudo por accidente
+# (el raw pesado vive fuera del repo, en ~/football_data/matches/<match>/).
+events_model/dataset/*.mp4
+events_model/dataset/tracking.csv
+
+# datos crudos: van a ~/football_data, no al repo
+events_model/dataset/*/tracking*.csv
+events_model/dataset/*/tracking*.json
+*.zip
+*.patch
